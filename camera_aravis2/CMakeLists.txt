@@ -94,6 +94,7 @@ if(isaac_ros_managed_nitros_FOUND
   list(APPEND COMMON_COMPILE_DEFINITIONS -DWITH_NITROS)
   list(APPEND DEPENDENCIES isaac_ros_managed_nitros isaac_ros_nitros_image_type)
   list(APPEND LIBRARIES CUDA::cudart)
+  set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
 else()
   message(STATUS "Isaac ROS NITROS not found: building without NITROS image publishing.")
 endif()
