@@ -1962,7 +1962,7 @@ void CameraDriver::publishNitrosImage(Stream& stream,
                          "NITROS publishing is enabled but stream '%s' has encoding '%s'. Only "
                          "'%s' is supported; skipping NITROS publication for this stream.",
                          stream.name.c_str(), p_img_msg->encoding.c_str(),
-                         sensor_msgs::image_encodings::RGB8.c_str());
+                         sensor_msgs::image_encodings::RGB8);
         return;
     }
 
