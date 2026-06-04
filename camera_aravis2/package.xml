@@ -25,6 +25,9 @@
   <depend>diagnostic_msgs</depend>
 
   <depend>camera_aravis2_msgs</depend>
+  
+  <depend>isaac_ros_managed_nitros</depend>
+  <depend>isaac_ros_nitros_image_type</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

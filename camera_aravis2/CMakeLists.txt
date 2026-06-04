@@ -83,6 +83,21 @@ set(LIBRARIES
   ${YAML_CPP_LIBRARY_DIRS}
 )
 
+# NVIDIA Isaac ROS NITROS (optional)
+find_package(isaac_ros_managed_nitros QUIET)
+find_package(isaac_ros_nitros_image_type QUIET)
+find_package(CUDAToolkit QUIET)
+if(isaac_ros_managed_nitros_FOUND
+    AND isaac_ros_nitros_image_type_FOUND
+    AND CUDAToolkit_FOUND)
+  message(STATUS "Isaac ROS NITROS found: enabling GPU NITROS image publishing.")
+  list(APPEND COMMON_COMPILE_DEFINITIONS -DWITH_NITROS)
+  list(APPEND DEPENDENCIES isaac_ros_managed_nitros isaac_ros_nitros_image_type)
+  list(APPEND LIBRARIES CUDA::cudart)
+else()
+  message(STATUS "Isaac ROS NITROS not found: building without NITROS image publishing.")
+endif()
+
 add_library(${LIBRARY_NAME} SHARED
   src/camera_aravis_node_base.cpp
   src/camera_driver_gv.cpp

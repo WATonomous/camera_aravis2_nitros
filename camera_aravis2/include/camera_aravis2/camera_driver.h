@@ -61,6 +61,13 @@ extern "C"
 #include <camera_aravis2_msgs/msg/camera_diagnostics.hpp>
 #include <camera_aravis2_msgs/srv/calculate_white_balance.hpp>
 
+
+#ifdef WITH_NITROS
+#include <isaac_ros_managed_nitros/managed_nitros_publisher.hpp>
+#include <isaac_ros_nitros_image_type/nitros_image.hpp>
+#include <isaac_ros_nitros_image_type/nitros_image_builder.hpp>
+#endif
+
 namespace camera_aravis2
 {
 
@@ -123,6 +130,13 @@ class CameraDriver : public CameraAravisNodeBase
 
         /// Camera publisher.
         image_transport::CameraPublisher camera_pub;
+
+#ifdef WITH_NITROS
+        /// Managed NITROS publisher for GPU-accelerated, zero-copy image transport.
+        std::shared_ptr<nvidia::isaac_ros::nitros::ManagedNitrosPublisher<
+          nvidia::isaac_ros::nitros::NitrosImage>>
+          p_nitros_pub;
+#endif
 
         /// Unique pointer to camera info manager.
         std::unique_ptr<camera_info_manager::CameraInfoManager> p_camera_info_manager;
@@ -484,6 +498,23 @@ class CameraDriver : public CameraAravisNodeBase
     void fillCameraInfoMsg(CameraDriver::Stream& stream,
                            const sensor_msgs::msg::Image::SharedPtr& p_img_msg) const;
 
+#ifdef WITH_NITROS
+    /**
+     * @brief Publish an image as a GPU-resident NITROS image.
+     *
+     * The host pixel data is copied onto the device via cudaMemcpy and wrapped into a NitrosImage
+     * using a managed NITROS image builder. The builder takes ownership of the device allocation
+     * and releases it once the NitrosImage has been consumed downstream.
+     *
+     * @note Only RGB8 encoded images are published. Images with other encodings are skipped.
+     *
+     * @param[in,out] stream Stream object which holds the NITROS publisher.
+     * @param[in] p_img_msg Pointer to the (already converted) image message to publish.
+     */
+    void publishNitrosImage(CameraDriver::Stream& stream,
+                            const sensor_msgs::msg::Image::SharedPtr& p_img_msg) const;
+#endif
+
     /**
      * @brief Pure virtual callback method to inject short processing routines after the
      * publication of each frame.
@@ -567,6 +598,11 @@ class CameraDriver : public CameraAravisNodeBase
 
     /// Number of subscribers currently connected to the message topic.
     int current_num_subscribers_;
+
+#ifdef WITH_NITROS
+    /// Flag indicating if images are additionally published as NITROS images.
+    bool is_nitros_enable_;
+#endif
 
     /// YAML node holding diagnostic features
     YAML::Node diagnostic_features_;

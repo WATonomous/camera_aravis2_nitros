@@ -33,6 +33,10 @@
 #include <rcl_interfaces/msg/integer_range.hpp>
 #include <rclcpp/time.hpp>
 
+#ifdef WITH_NITROS
+#include <cuda_runtime.h>
+#endif
+
 /// Conversions from integers to Arv types.
 static const char* ARV_BUFFER_STATUS_FROM_INT[] =
   {"ARV_BUFFER_STATUS_SUCCESS", "ARV_BUFFER_STATUS_CLEARED",
@@ -52,6 +56,10 @@ CameraDriver::CameraDriver(const std::string& name, const rclcpp::NodeOptions& o
   is_diagnostics_published_(false),
   p_diagnostic_pub_(nullptr),
   current_num_subscribers_(0)
+#ifdef WITH_NITROS
+  ,
+  is_nitros_enable_(false)
+#endif
 {
 }
 
@@ -137,6 +145,15 @@ void CameraDriver::setupParameters()
       "Activate verbose output.";
     declare_parameter<bool>("verbose", false, verbose_desc);
 
+#ifdef WITH_NITROS
+    auto nitros_enable_desc = rcl_interfaces::msg::ParameterDescriptor{};
+    nitros_enable_desc.description =
+      "Additionally publish each RGB8 stream as a GPU-resident NITROS image on the "
+      "'<stream>/image_raw/nitros' topic for zero-copy transport to downstream Isaac ROS nodes.";
+    nitros_enable_desc.read_only = true;
+    declare_parameter<bool>("nitros_enable", false, nitros_enable_desc);
+#endif
+
     //--- register parameter change callback
     p_parameter_callback_handle_ = add_on_set_parameters_callback(
       std::bind(&CameraDriver::handleDynamicParameterChange, this, std::placeholders::_1));
@@ -152,6 +169,10 @@ bool CameraDriver::setupCameraStreamStructs()
     auto stream_names     = get_parameter("stream_names").as_string_array();
     auto camera_info_urls = get_parameter("camera_info_urls").as_string_array();
     auto base_frame_id    = get_parameter("frame_id").as_string();
+
+#ifdef WITH_NITROS
+    is_nitros_enable_ = get_parameter("nitros_enable").as_bool();
+#endif
 
     bool is_camera_info_url_param_empty = camera_info_urls.empty();
 
@@ -261,6 +282,18 @@ bool CameraDriver::setupCameraStreamStructs()
         bool is_successful = stream.p_camera_info_manager->loadCameraInfo(stream.camera_info_url);
         if (!is_successful)
             return false;
+
+#ifdef WITH_NITROS
+        //--- create managed NITROS publisher for GPU-accelerated image transport
+        if (is_nitros_enable_)
+        {
+            stream.p_nitros_pub = std::make_shared<
+              nvidia::isaac_ros::nitros::ManagedNitrosPublisher<
+                nvidia::isaac_ros::nitros::NitrosImage>>(
+              this, topic_name + "/nitros",
+              nvidia::isaac_ros::nitros::nitros_image_rgb8_t::supported_type_name);
+        }
+#endif
     }
 
     //--- check if at least one stream was initialized
@@ -1806,6 +1839,12 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         //--- publish
         stream.camera_pub.publish(p_img_msg, stream.p_cam_info_msg);
 
+#ifdef WITH_NITROS
+        //--- additionally publish image on the GPU via NITROS, if enabled
+        if (stream.p_nitros_pub)
+            publishNitrosImage(stream, p_img_msg);
+#endif
+
         //--- do post frame processing
         postFrameProcessingCallback(stream_id);
     }
@@ -1910,6 +1949,58 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
         stream.p_cam_info_msg->height = p_img_msg->height;
     }
 }
+
+#ifdef WITH_NITROS
+//==================================================================================================
+void CameraDriver::publishNitrosImage(Stream& stream,
+                                      const sensor_msgs::msg::Image::SharedPtr& p_img_msg) const
+{
+    //--- NITROS publishing is only implemented for RGB8 encoded images
+    if (p_img_msg->encoding != sensor_msgs::image_encodings::RGB8)
+    {
+        RCLCPP_WARN_ONCE(logger_,
+                         "NITROS publishing is enabled but stream '%s' has encoding '%s'. Only "
+                         "'%s' is supported; skipping NITROS publication for this stream.",
+                         stream.name.c_str(), p_img_msg->encoding.c_str(),
+                         sensor_msgs::image_encodings::RGB8.c_str());
+        return;
+    }
+
+    //--- copy the host image buffer onto the device. The NitrosImageBuilder takes ownership of the
+    //--- device allocation and releases it (cudaFree) once the NitrosImage is consumed downstream.
+    const size_t IMG_SIZE = p_img_msg->data.size();
+    void* p_gpu_data      = nullptr;
+
+    cudaError_t cuda_err = cudaMalloc(&p_gpu_data, IMG_SIZE);
+    if (cuda_err != cudaSuccess)
+    {
+        RCLCPP_ERROR(logger_,
+                     "(%s) Failed to allocate %zu B of device memory for NITROS image: %s.",
+                     stream.name.c_str(), IMG_SIZE, cudaGetErrorString(cuda_err));
+        return;
+    }
+
+    cuda_err = cudaMemcpy(p_gpu_data, p_img_msg->data.data(), IMG_SIZE, cudaMemcpyHostToDevice);
+    if (cuda_err != cudaSuccess)
+    {
+        RCLCPP_ERROR(logger_, "(%s) Failed to copy image to device for NITROS image: %s.",
+                     stream.name.c_str(), cudaGetErrorString(cuda_err));
+        cudaFree(p_gpu_data);
+        return;
+    }
+
+    //--- build the NITROS image wrapping the device buffer and publish it
+    nvidia::isaac_ros::nitros::NitrosImage nitros_image =
+      nvidia::isaac_ros::nitros::NitrosImageBuilder()
+        .WithHeader(p_img_msg->header)
+        .WithEncoding(p_img_msg->encoding)
+        .WithDimensions(p_img_msg->height, p_img_msg->width)
+        .WithGpuData(p_gpu_data)
+        .Build();
+
+    stream.p_nitros_pub->publish(nitros_image);
+}
+#endif
 
 //==================================================================================================
 void CameraDriver::printCameraConfiguration() const
