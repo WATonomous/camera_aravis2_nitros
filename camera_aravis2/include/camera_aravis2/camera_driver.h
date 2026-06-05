@@ -136,6 +136,11 @@ class CameraDriver : public CameraAravisNodeBase
         std::shared_ptr<nvidia::isaac_ros::nitros::ManagedNitrosPublisher<
           nvidia::isaac_ros::nitros::NitrosImage>>
           p_nitros_pub;
+
+        /// Camera-info publisher used while NITROS is enabled. The CPU image_raw publication is
+        /// suppressed in that mode, but camera_info must still be emitted on the conventional
+        /// topic so downstream Isaac ROS nodes (e.g. RectifyNode) can synchronize against it.
+        rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr p_cam_info_pub;
 #endif
 
         /// Unique pointer to camera info manager.

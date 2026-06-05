@@ -293,6 +293,14 @@ bool CameraDriver::setupCameraStreamStructs()
                 nvidia::isaac_ros::nitros::NitrosImage>>(
               this, topic_name + "/nitros",
               nvidia::isaac_ros::nitros::nitros_image_rgb8_t::supported_type_name);
+
+            //--- the CPU image_raw image is not published under NITROS, but camera_info still must
+            //--- be. Publish it on the conventional sibling topic of image_raw (the same topic the
+            //--- image_transport::CameraPublisher would use), with default reliable QoS.
+            const std::string cam_info_topic =
+              topic_name.substr(0, topic_name.rfind('/')) + "/camera_info";
+            stream.p_cam_info_pub =
+              this->create_publisher<sensor_msgs::msg::CameraInfo>(cam_info_topic, rclcpp::QoS(10));
         }
 #endif
     }
@@ -1129,6 +1137,13 @@ void CameraDriver::handleMessageSubscriptionChange(rclcpp::MatchedInfo& iEventIn
 {
     GuardedGError err;
 
+#ifdef WITH_NITROS
+    //--- Under NITROS the camera streams continuously (see initialization), independently of
+    //--- image_raw subscribers. Ignore image_raw subscription changes so they cannot stop it.
+    if (is_nitros_enable_)
+        return;
+#endif
+
     //--- evaluate whether to start or stop acquisition only if device is available and if the
     //--- node is initialized.
     if (p_device_ && this->is_initialized_)
@@ -1777,6 +1792,13 @@ void CameraDriver::spawnCameraStreams()
     current_num_subscribers_ = 1;
 #endif
 
+#ifdef WITH_NITROS
+    //--- Under NITROS the image_raw image is not published, so acquisition cannot be gated on its
+    //--- subscribers. Force the camera to stream so NITROS consumers always receive frames.
+    if (is_nitros_enable_)
+        current_num_subscribers_ = 1;
+#endif
+
     //--- When there are already subscribers to the image topic, start acquisition.
     if (current_num_subscribers_ > 0)
     {
@@ -1838,13 +1860,21 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         fillCameraInfoMsg(stream, p_img_msg);
 
         //--- publish
-        stream.camera_pub.publish(p_img_msg, stream.p_cam_info_msg);
-
 #ifdef WITH_NITROS
-        //--- additionally publish image on the GPU via NITROS, if enabled
         if (stream.p_nitros_pub)
+        {
+            //--- NITROS enabled: skip the CPU image_raw publication entirely (the GPU NITROS image
+            //--- replaces it) and emit only camera_info on the conventional topic so downstream
+            //--- Isaac ROS nodes can synchronize against it.
+            if (stream.p_cam_info_pub)
+                stream.p_cam_info_pub->publish(*stream.p_cam_info_msg);
             publishNitrosImage(stream, p_img_msg);
+        }
+        else
 #endif
+        {
+            stream.camera_pub.publish(p_img_msg, stream.p_cam_info_msg);
+        }
 
         //--- do post frame processing
         postFrameProcessingCallback(stream_id);
