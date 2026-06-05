@@ -502,11 +502,14 @@ class CameraDriver : public CameraAravisNodeBase
     /**
      * @brief Publish an image as a GPU-resident NITROS image.
      *
-     * The host pixel data is copied onto the device via cudaMemcpy and wrapped into a NitrosImage
-     * using a managed NITROS image builder. The builder takes ownership of the device allocation
-     * and releases it once the NitrosImage has been consumed downstream.
+     * The host image is uploaded to the device via cudaMemcpy and wrapped into a NitrosImage using
+     * a managed NITROS image builder. Bayer input is demosaiced into RGB8 on the GPU with NVIDIA
+     * Performance Primitives (nppiCFAToRGB); already-RGB8 input is uploaded as-is. The builder
+     * takes ownership of the device allocation and releases it once the NitrosImage has been
+     * consumed downstream.
      *
-     * @note Only RGB8 encoded images are published. Images with other encodings are skipped.
+     * @note NITROS has no Bayer image type, so the published image is always RGB8. Only RGB8 and
+     * 8-bit Bayer encodings are supported; any other encoding is skipped.
      *
      * @param[in,out] stream Stream object which holds the NITROS publisher.
      * @param[in] p_img_msg Pointer to the (already converted) image message to publish.

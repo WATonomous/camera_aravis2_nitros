@@ -35,6 +35,7 @@
 
 #ifdef WITH_NITROS
 #include <cuda_runtime.h>
+#include <nppi_color_conversion.h>
 #endif
 
 /// Conversions from integers to Arv types.
@@ -1951,51 +1952,145 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
 }
 
 #ifdef WITH_NITROS
+namespace
+{
+//--------------------------------------------------------------------------------------------------
+/**
+ * @brief Map a ROS 8-bit Bayer encoding to the matching NPP CFA grid-registration position.
+ *
+ * The grid name corresponds to the top-left 2x2 sensor pattern, which is exactly what the ROS
+ * `bayer_*8` encoding string describes, so the mapping is one-to-one. If red and blue come out
+ * swapped on real hardware, swap RGGB<->BGGR and GBRG<->GRBG here.
+ *
+ * @return true and sets @p grid if @p encoding is an 8-bit Bayer encoding; false otherwise.
+ */
+bool mapRosBayerToNppGrid(const std::string& encoding, NppiBayerGridPosition& grid)
+{
+    namespace enc = sensor_msgs::image_encodings;
+    if (encoding == enc::BAYER_RGGB8)
+        grid = NPPI_BAYER_RGGB;
+    else if (encoding == enc::BAYER_BGGR8)
+        grid = NPPI_BAYER_BGGR;
+    else if (encoding == enc::BAYER_GBRG8)
+        grid = NPPI_BAYER_GBRG;
+    else if (encoding == enc::BAYER_GRBG8)
+        grid = NPPI_BAYER_GRBG;
+    else
+        return false;
+    return true;
+}
+}  // namespace
+
 //==================================================================================================
 void CameraDriver::publishNitrosImage(Stream& stream,
                                       const sensor_msgs::msg::Image::SharedPtr& p_img_msg) const
 {
-    //--- NITROS publishing is only implemented for RGB8 encoded images
-    if (p_img_msg->encoding != sensor_msgs::image_encodings::RGB8)
+    const int width  = static_cast<int>(p_img_msg->width);
+    const int height = static_cast<int>(p_img_msg->height);
+
+    //--- The published NITROS image is always RGB8 (NITROS has no Bayer image type). These cameras
+    //--- deliver single-channel Bayer, which is demosaiced directly on the device with NVIDIA
+    //--- Performance Primitives (NPP). An image that already is RGB8 is uploaded as-is; any other
+    //--- encoding is skipped.
+    NppiBayerGridPosition bayer_grid;
+    const bool is_bayer8 = mapRosBayerToNppGrid(p_img_msg->encoding, bayer_grid);
+    const bool is_rgb8   = (p_img_msg->encoding == sensor_msgs::image_encodings::RGB8);
+
+    if (!is_bayer8 && !is_rgb8)
     {
         RCLCPP_WARN_ONCE(logger_,
                          "NITROS publishing is enabled but stream '%s' has encoding '%s'. Only "
-                         "'%s' is supported; skipping NITROS publication for this stream.",
-                         stream.name.c_str(), p_img_msg->encoding.c_str(),
-                         sensor_msgs::image_encodings::RGB8);
+                         "RGB8 and 8-bit Bayer encodings are supported; skipping NITROS "
+                         "publication for this stream.",
+                         stream.name.c_str(), p_img_msg->encoding.c_str());
         return;
     }
 
-    //--- copy the host image buffer onto the device. The NitrosImageBuilder takes ownership of the
-    //--- device allocation and releases it (cudaFree) once the NitrosImage is consumed downstream.
-    const size_t IMG_SIZE = p_img_msg->data.size();
-    void* p_gpu_data      = nullptr;
+    //--- the device buffer handed to NITROS always holds packed RGB8. The NitrosImageBuilder takes
+    //--- ownership of it and releases it (cudaFree) once the NitrosImage is consumed downstream.
+    const size_t RGB_SIZE = static_cast<size_t>(width) * height * 3;
+    void* p_gpu_rgb       = nullptr;
 
-    cudaError_t cuda_err = cudaMalloc(&p_gpu_data, IMG_SIZE);
+    cudaError_t cuda_err = cudaMalloc(&p_gpu_rgb, RGB_SIZE);
     if (cuda_err != cudaSuccess)
     {
         RCLCPP_ERROR(logger_,
                      "(%s) Failed to allocate %zu B of device memory for NITROS image: %s.",
-                     stream.name.c_str(), IMG_SIZE, cudaGetErrorString(cuda_err));
+                     stream.name.c_str(), RGB_SIZE, cudaGetErrorString(cuda_err));
         return;
     }
 
-    cuda_err = cudaMemcpy(p_gpu_data, p_img_msg->data.data(), IMG_SIZE, cudaMemcpyHostToDevice);
-    if (cuda_err != cudaSuccess)
+    if (is_bayer8)
     {
-        RCLCPP_ERROR(logger_, "(%s) Failed to copy image to device for NITROS image: %s.",
-                     stream.name.c_str(), cudaGetErrorString(cuda_err));
-        cudaFree(p_gpu_data);
-        return;
+        //--- upload the raw Bayer frame and demosaic it into the RGB8 device buffer with NPP
+        const size_t BAYER_SIZE = static_cast<size_t>(p_img_msg->step) * height;
+        void* p_gpu_bayer       = nullptr;
+
+        cuda_err = cudaMalloc(&p_gpu_bayer, BAYER_SIZE);
+        if (cuda_err != cudaSuccess)
+        {
+            RCLCPP_ERROR(logger_,
+                         "(%s) Failed to allocate %zu B of device memory for Bayer input: %s.",
+                         stream.name.c_str(), BAYER_SIZE, cudaGetErrorString(cuda_err));
+            cudaFree(p_gpu_rgb);
+            return;
+        }
+
+        cuda_err = cudaMemcpy(p_gpu_bayer, p_img_msg->data.data(), BAYER_SIZE,
+                              cudaMemcpyHostToDevice);
+        if (cuda_err != cudaSuccess)
+        {
+            RCLCPP_ERROR(logger_, "(%s) Failed to copy Bayer image to device for NITROS image: %s.",
+                         stream.name.c_str(), cudaGetErrorString(cuda_err));
+            cudaFree(p_gpu_bayer);
+            cudaFree(p_gpu_rgb);
+            return;
+        }
+
+        const NppiSize src_size = {width, height};
+        const NppiRect src_roi  = {0, 0, width, height};
+
+        //--- eInterpolation must be NPPI_INTER_UNDEFINED (0): NPP demosaics with bilinear
+        //--- interpolation and chroma-correlated green generation; no other mode is supported.
+        const NppStatus npp_status = nppiCFAToRGB_8u_C1C3R(
+          static_cast<const Npp8u*>(p_gpu_bayer), static_cast<int>(p_img_msg->step), src_size,
+          src_roi, static_cast<Npp8u*>(p_gpu_rgb), width * 3, bayer_grid, NPPI_INTER_UNDEFINED);
+
+        //--- the debayer runs asynchronously on NPP's default stream; wait for it to finish (the
+        //--- Bayer input can be freed once it has) before the RGB buffer is published downstream.
+        const cudaError_t sync_err = cudaDeviceSynchronize();
+        cudaFree(p_gpu_bayer);
+
+        if (npp_status != NPP_SUCCESS || sync_err != cudaSuccess)
+        {
+            RCLCPP_ERROR(logger_,
+                         "(%s) Failed to demosaic Bayer image with NPP (status %d, sync: %s); "
+                         "skipping NITROS publication.",
+                         stream.name.c_str(), static_cast<int>(npp_status),
+                         cudaGetErrorString(sync_err));
+            cudaFree(p_gpu_rgb);
+            return;
+        }
+    }
+    else  // is_rgb8: no demosaicing needed, copy the host buffer straight onto the device
+    {
+        cuda_err = cudaMemcpy(p_gpu_rgb, p_img_msg->data.data(), RGB_SIZE, cudaMemcpyHostToDevice);
+        if (cuda_err != cudaSuccess)
+        {
+            RCLCPP_ERROR(logger_, "(%s) Failed to copy image to device for NITROS image: %s.",
+                         stream.name.c_str(), cudaGetErrorString(cuda_err));
+            cudaFree(p_gpu_rgb);
+            return;
+        }
     }
 
     //--- build the NITROS image wrapping the device buffer and publish it
     nvidia::isaac_ros::nitros::NitrosImage nitros_image =
       nvidia::isaac_ros::nitros::NitrosImageBuilder()
         .WithHeader(p_img_msg->header)
-        .WithEncoding(p_img_msg->encoding)
-        .WithDimensions(p_img_msg->height, p_img_msg->width)
-        .WithGpuData(p_gpu_data)
+        .WithEncoding(sensor_msgs::image_encodings::RGB8)
+        .WithDimensions(height, width)
+        .WithGpuData(p_gpu_rgb)
         .Build();
 
     stream.p_nitros_pub->publish(nitros_image);
