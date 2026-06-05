@@ -35,6 +35,7 @@
 
 #ifdef WITH_NITROS
 #include <cuda_runtime.h>
+#include <nppcore.h>
 #include <nppi_color_conversion.h>
 #endif
 
@@ -2050,11 +2051,22 @@ void CameraDriver::publishNitrosImage(Stream& stream,
         const NppiSize src_size = {width, height};
         const NppiRect src_roi  = {0, 0, width, height};
 
-        //--- eInterpolation must be NPPI_INTER_UNDEFINED (0): NPP demosaics with bilinear
-        //--- interpolation and chroma-correlated green generation; no other mode is supported.
-        const NppStatus npp_status = nppiCFAToRGB_8u_C1C3R(
+        NppStreamContext npp_ctx;
+        if (nppGetStreamContext(&npp_ctx) != NPP_SUCCESS)
+        {
+            RCLCPP_ERROR(logger_,
+                         "(%s) Failed to obtain NPP stream context; skipping NITROS publication.",
+                         stream.name.c_str());
+            cudaFree(p_gpu_bayer);
+            cudaFree(p_gpu_rgb);
+            return;
+        }
+
+
+        const NppStatus npp_status = nppiCFAToRGB_8u_C1C3R_Ctx(
           static_cast<const Npp8u*>(p_gpu_bayer), static_cast<int>(p_img_msg->step), src_size,
-          src_roi, static_cast<Npp8u*>(p_gpu_rgb), width * 3, bayer_grid, NPPI_INTER_UNDEFINED);
+          src_roi, static_cast<Npp8u*>(p_gpu_rgb), width * 3, bayer_grid, NPPI_INTER_UNDEFINED,
+          npp_ctx);
 
         //--- the debayer runs asynchronously on NPP's default stream; wait for it to finish (the
         //--- Bayer input can be freed once it has) before the RGB buffer is published downstream.
