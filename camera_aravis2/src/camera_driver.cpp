@@ -35,7 +35,6 @@
 
 #ifdef WITH_NITROS
 #include <cuda_runtime.h>
-#include <nppcore.h>
 #include <nppi_color_conversion.h>
 #endif
 
@@ -1980,6 +1979,38 @@ bool mapRosBayerToNppGrid(const std::string& encoding, NppiBayerGridPosition& gr
         return false;
     return true;
 }
+
+
+cudaError_t buildNppStreamContext(NppStreamContext& ctx)
+{
+    ctx         = NppStreamContext{};
+    ctx.hStream = 0;  // NPP default stream
+
+    cudaError_t err = cudaGetDevice(&ctx.nCudaDeviceId);
+    if (err != cudaSuccess)
+        return err;
+
+    const int dev            = ctx.nCudaDeviceId;
+    int shared_mem_per_block = 0;
+    if ((err = cudaDeviceGetAttribute(&ctx.nMultiProcessorCount,
+                                      cudaDevAttrMultiProcessorCount, dev)) != cudaSuccess ||
+        (err = cudaDeviceGetAttribute(&ctx.nMaxThreadsPerMultiProcessor,
+                                      cudaDevAttrMaxThreadsPerMultiProcessor, dev)) != cudaSuccess ||
+        (err = cudaDeviceGetAttribute(&ctx.nMaxThreadsPerBlock,
+                                      cudaDevAttrMaxThreadsPerBlock, dev)) != cudaSuccess ||
+        (err = cudaDeviceGetAttribute(&shared_mem_per_block,
+                                      cudaDevAttrMaxSharedMemoryPerBlock, dev)) != cudaSuccess ||
+        (err = cudaDeviceGetAttribute(&ctx.nCudaDevAttrComputeCapabilityMajor,
+                                      cudaDevAttrComputeCapabilityMajor, dev)) != cudaSuccess ||
+        (err = cudaDeviceGetAttribute(&ctx.nCudaDevAttrComputeCapabilityMinor,
+                                      cudaDevAttrComputeCapabilityMinor, dev)) != cudaSuccess)
+    {
+        return err;
+    }
+    ctx.nSharedMemPerBlock = static_cast<size_t>(shared_mem_per_block);
+
+    return cudaStreamGetFlags(ctx.hStream, &ctx.nStreamFlags);
+}
 }  // namespace
 
 //==================================================================================================
@@ -2051,12 +2082,14 @@ void CameraDriver::publishNitrosImage(Stream& stream,
         const NppiSize src_size = {width, height};
         const NppiRect src_roi  = {0, 0, width, height};
 
+
         NppStreamContext npp_ctx;
-        if (nppGetStreamContext(&npp_ctx) != NPP_SUCCESS)
+        cuda_err = buildNppStreamContext(npp_ctx);
+        if (cuda_err != cudaSuccess)
         {
             RCLCPP_ERROR(logger_,
-                         "(%s) Failed to obtain NPP stream context; skipping NITROS publication.",
-                         stream.name.c_str());
+                         "(%s) Failed to build NPP stream context: %s; skipping NITROS publication.",
+                         stream.name.c_str(), cudaGetErrorString(cuda_err));
             cudaFree(p_gpu_bayer);
             cudaFree(p_gpu_rgb);
             return;
