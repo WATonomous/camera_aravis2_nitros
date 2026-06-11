@@ -33,6 +33,11 @@
 #include <rcl_interfaces/msg/integer_range.hpp>
 #include <rclcpp/time.hpp>
 
+#ifdef WITH_NITROS
+#include <cuda_runtime.h>
+#include <nppi_color_conversion.h>
+#endif
+
 /// Conversions from integers to Arv types.
 static const char* ARV_BUFFER_STATUS_FROM_INT[] =
   {"ARV_BUFFER_STATUS_SUCCESS", "ARV_BUFFER_STATUS_CLEARED",
@@ -52,6 +57,10 @@ CameraDriver::CameraDriver(const std::string& name, const rclcpp::NodeOptions& o
   is_diagnostics_published_(false),
   p_diagnostic_pub_(nullptr),
   current_num_subscribers_(0)
+#ifdef WITH_NITROS
+  ,
+  is_nitros_enable_(false)
+#endif
 {
 }
 
@@ -137,6 +146,15 @@ void CameraDriver::setupParameters()
       "Activate verbose output.";
     declare_parameter<bool>("verbose", false, verbose_desc);
 
+#ifdef WITH_NITROS
+    auto nitros_enable_desc = rcl_interfaces::msg::ParameterDescriptor{};
+    nitros_enable_desc.description =
+      "Additionally publish each RGB8 stream as a GPU-resident NITROS image on the "
+      "'<stream>/image_raw/nitros' topic for zero-copy transport to downstream Isaac ROS nodes.";
+    nitros_enable_desc.read_only = true;
+    declare_parameter<bool>("nitros_enable", false, nitros_enable_desc);
+#endif
+
     //--- register parameter change callback
     p_parameter_callback_handle_ = add_on_set_parameters_callback(
       std::bind(&CameraDriver::handleDynamicParameterChange, this, std::placeholders::_1));
@@ -152,6 +170,10 @@ bool CameraDriver::setupCameraStreamStructs()
     auto stream_names     = get_parameter("stream_names").as_string_array();
     auto camera_info_urls = get_parameter("camera_info_urls").as_string_array();
     auto base_frame_id    = get_parameter("frame_id").as_string();
+
+#ifdef WITH_NITROS
+    is_nitros_enable_ = get_parameter("nitros_enable").as_bool();
+#endif
 
     bool is_camera_info_url_param_empty = camera_info_urls.empty();
 
@@ -261,6 +283,26 @@ bool CameraDriver::setupCameraStreamStructs()
         bool is_successful = stream.p_camera_info_manager->loadCameraInfo(stream.camera_info_url);
         if (!is_successful)
             return false;
+
+#ifdef WITH_NITROS
+        //--- create managed NITROS publisher for GPU-accelerated image transport
+        if (is_nitros_enable_)
+        {
+            stream.p_nitros_pub = std::make_shared<
+              nvidia::isaac_ros::nitros::ManagedNitrosPublisher<
+                nvidia::isaac_ros::nitros::NitrosImage>>(
+              this, topic_name + "/nitros",
+              nvidia::isaac_ros::nitros::nitros_image_rgb8_t::supported_type_name);
+
+            //--- the CPU image_raw image is not published under NITROS, but camera_info still must
+            //--- be. Publish it on the conventional sibling topic of image_raw (the same topic the
+            //--- image_transport::CameraPublisher would use), with default reliable QoS.
+            const std::string cam_info_topic =
+              topic_name.substr(0, topic_name.rfind('/')) + "/camera_info";
+            stream.p_cam_info_pub =
+              this->create_publisher<sensor_msgs::msg::CameraInfo>(cam_info_topic, rclcpp::QoS(10));
+        }
+#endif
     }
 
     //--- check if at least one stream was initialized
@@ -1095,6 +1137,13 @@ void CameraDriver::handleMessageSubscriptionChange(rclcpp::MatchedInfo& iEventIn
 {
     GuardedGError err;
 
+#ifdef WITH_NITROS
+    //--- Under NITROS the camera streams continuously (see initialization), independently of
+    //--- image_raw subscribers. Ignore image_raw subscription changes so they cannot stop it.
+    if (is_nitros_enable_)
+        return;
+#endif
+
     //--- evaluate whether to start or stop acquisition only if device is available and if the
     //--- node is initialized.
     if (p_device_ && this->is_initialized_)
@@ -1743,6 +1792,13 @@ void CameraDriver::spawnCameraStreams()
     current_num_subscribers_ = 1;
 #endif
 
+#ifdef WITH_NITROS
+    //--- Under NITROS the image_raw image is not published, so acquisition cannot be gated on its
+    //--- subscribers. Force the camera to stream so NITROS consumers always receive frames.
+    if (is_nitros_enable_)
+        current_num_subscribers_ = 1;
+#endif
+
     //--- When there are already subscribers to the image topic, start acquisition.
     if (current_num_subscribers_ > 0)
     {
@@ -1804,7 +1860,21 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         fillCameraInfoMsg(stream, p_img_msg);
 
         //--- publish
-        stream.camera_pub.publish(p_img_msg, stream.p_cam_info_msg);
+#ifdef WITH_NITROS
+        if (stream.p_nitros_pub)
+        {
+            //--- NITROS enabled: skip the CPU image_raw publication entirely (the GPU NITROS image
+            //--- replaces it) and emit only camera_info on the conventional topic so downstream
+            //--- Isaac ROS nodes can synchronize against it.
+            if (stream.p_cam_info_pub)
+                stream.p_cam_info_pub->publish(*stream.p_cam_info_msg);
+            publishNitrosImage(stream, p_img_msg);
+        }
+        else
+#endif
+        {
+            stream.camera_pub.publish(p_img_msg, stream.p_cam_info_msg);
+        }
 
         //--- do post frame processing
         postFrameProcessingCallback(stream_id);
@@ -1910,6 +1980,199 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
         stream.p_cam_info_msg->height = p_img_msg->height;
     }
 }
+
+#ifdef WITH_NITROS
+namespace
+{
+//--------------------------------------------------------------------------------------------------
+/**
+ * @brief Map a ROS 8-bit Bayer encoding to the matching NPP CFA grid-registration position.
+ *
+ * The grid name corresponds to the top-left 2x2 sensor pattern, which is exactly what the ROS
+ * `bayer_*8` encoding string describes, so the mapping is one-to-one. If red and blue come out
+ * swapped on real hardware, swap RGGB<->BGGR and GBRG<->GRBG here.
+ *
+ * @return true and sets @p grid if @p encoding is an 8-bit Bayer encoding; false otherwise.
+ */
+bool mapRosBayerToNppGrid(const std::string& encoding, NppiBayerGridPosition& grid)
+{
+    namespace enc = sensor_msgs::image_encodings;
+    if (encoding == enc::BAYER_RGGB8)
+        grid = NPPI_BAYER_RGGB;
+    else if (encoding == enc::BAYER_BGGR8)
+        grid = NPPI_BAYER_BGGR;
+    else if (encoding == enc::BAYER_GBRG8)
+        grid = NPPI_BAYER_GBRG;
+    else if (encoding == enc::BAYER_GRBG8)
+        grid = NPPI_BAYER_GRBG;
+    else
+        return false;
+    return true;
+}
+
+
+cudaError_t buildNppStreamContext(NppStreamContext& ctx)
+{
+    ctx         = NppStreamContext{};
+    ctx.hStream = 0;  // NPP default stream
+
+    cudaError_t err = cudaGetDevice(&ctx.nCudaDeviceId);
+    if (err != cudaSuccess)
+        return err;
+
+    const int dev            = ctx.nCudaDeviceId;
+    int shared_mem_per_block = 0;
+    if ((err = cudaDeviceGetAttribute(&ctx.nMultiProcessorCount,
+                                      cudaDevAttrMultiProcessorCount, dev)) != cudaSuccess ||
+        (err = cudaDeviceGetAttribute(&ctx.nMaxThreadsPerMultiProcessor,
+                                      cudaDevAttrMaxThreadsPerMultiProcessor, dev))
+            != cudaSuccess ||
+        (err = cudaDeviceGetAttribute(&ctx.nMaxThreadsPerBlock,
+                                      cudaDevAttrMaxThreadsPerBlock, dev)) != cudaSuccess ||
+        (err = cudaDeviceGetAttribute(&shared_mem_per_block,
+                                      cudaDevAttrMaxSharedMemoryPerBlock, dev)) != cudaSuccess ||
+        (err = cudaDeviceGetAttribute(&ctx.nCudaDevAttrComputeCapabilityMajor,
+                                      cudaDevAttrComputeCapabilityMajor, dev)) != cudaSuccess ||
+        (err = cudaDeviceGetAttribute(&ctx.nCudaDevAttrComputeCapabilityMinor,
+                                      cudaDevAttrComputeCapabilityMinor, dev)) != cudaSuccess)
+    {
+        return err;
+    }
+    ctx.nSharedMemPerBlock = static_cast<size_t>(shared_mem_per_block);
+
+    return cudaStreamGetFlags(ctx.hStream, &ctx.nStreamFlags);
+}
+}  // namespace
+
+//==================================================================================================
+void CameraDriver::publishNitrosImage(Stream& stream,
+                                      const sensor_msgs::msg::Image::SharedPtr& p_img_msg) const
+{
+    const int width  = static_cast<int>(p_img_msg->width);
+    const int height = static_cast<int>(p_img_msg->height);
+
+    //--- The published NITROS image is always RGB8 (NITROS has no Bayer image type). These cameras
+    //--- deliver single-channel Bayer, which is demosaiced directly on the device with NVIDIA
+    //--- Performance Primitives (NPP). An image that already is RGB8 is uploaded as-is; any other
+    //--- encoding is skipped.
+    NppiBayerGridPosition bayer_grid;
+    const bool is_bayer8 = mapRosBayerToNppGrid(p_img_msg->encoding, bayer_grid);
+    const bool is_rgb8   = (p_img_msg->encoding == sensor_msgs::image_encodings::RGB8);
+
+    if (!is_bayer8 && !is_rgb8)
+    {
+        RCLCPP_WARN_ONCE(logger_,
+                         "NITROS publishing is enabled but stream '%s' has encoding '%s'. Only "
+                         "RGB8 and 8-bit Bayer encodings are supported; skipping NITROS "
+                         "publication for this stream.",
+                         stream.name.c_str(), p_img_msg->encoding.c_str());
+        return;
+    }
+
+    //--- the device buffer handed to NITROS always holds packed RGB8. The NitrosImageBuilder takes
+    //--- ownership of it and releases it (cudaFree) once the NitrosImage is consumed downstream.
+    const size_t RGB_SIZE = static_cast<size_t>(width) * height * 3;
+    void* p_gpu_rgb       = nullptr;
+
+    cudaError_t cuda_err = cudaMalloc(&p_gpu_rgb, RGB_SIZE);
+    if (cuda_err != cudaSuccess)
+    {
+        RCLCPP_ERROR(logger_,
+                     "(%s) Failed to allocate %zu B of device memory for NITROS image: %s.",
+                     stream.name.c_str(), RGB_SIZE, cudaGetErrorString(cuda_err));
+        return;
+    }
+
+    if (is_bayer8)
+    {
+        //--- upload the raw Bayer frame and demosaic it into the RGB8 device buffer with NPP
+        const size_t BAYER_SIZE = static_cast<size_t>(p_img_msg->step) * height;
+        void* p_gpu_bayer       = nullptr;
+
+        cuda_err = cudaMalloc(&p_gpu_bayer, BAYER_SIZE);
+        if (cuda_err != cudaSuccess)
+        {
+            RCLCPP_ERROR(logger_,
+                         "(%s) Failed to allocate %zu B of device memory for Bayer input: %s.",
+                         stream.name.c_str(), BAYER_SIZE, cudaGetErrorString(cuda_err));
+            cudaFree(p_gpu_rgb);
+            return;
+        }
+
+        cuda_err = cudaMemcpy(p_gpu_bayer, p_img_msg->data.data(), BAYER_SIZE,
+                              cudaMemcpyHostToDevice);
+        if (cuda_err != cudaSuccess)
+        {
+            RCLCPP_ERROR(logger_, "(%s) Failed to copy Bayer image to device for NITROS image: %s.",
+                         stream.name.c_str(), cudaGetErrorString(cuda_err));
+            cudaFree(p_gpu_bayer);
+            cudaFree(p_gpu_rgb);
+            return;
+        }
+
+        const NppiSize src_size = {width, height};
+        const NppiRect src_roi  = {0, 0, width, height};
+
+
+        NppStreamContext npp_ctx;
+        cuda_err = buildNppStreamContext(npp_ctx);
+        if (cuda_err != cudaSuccess)
+        {
+            RCLCPP_ERROR(logger_,
+                         "(%s) Failed to build NPP stream context: %s; "
+                         "skipping NITROS publication.",
+                         stream.name.c_str(), cudaGetErrorString(cuda_err));
+            cudaFree(p_gpu_bayer);
+            cudaFree(p_gpu_rgb);
+            return;
+        }
+
+
+        const NppStatus npp_status = nppiCFAToRGB_8u_C1C3R_Ctx(
+          static_cast<const Npp8u*>(p_gpu_bayer), static_cast<int>(p_img_msg->step), src_size,
+          src_roi, static_cast<Npp8u*>(p_gpu_rgb), width * 3, bayer_grid, NPPI_INTER_UNDEFINED,
+          npp_ctx);
+
+        //--- the debayer runs asynchronously on NPP's default stream; wait for it to finish (the
+        //--- Bayer input can be freed once it has) before the RGB buffer is published downstream.
+        const cudaError_t sync_err = cudaDeviceSynchronize();
+        cudaFree(p_gpu_bayer);
+
+        if (npp_status != NPP_SUCCESS || sync_err != cudaSuccess)
+        {
+            RCLCPP_ERROR(logger_,
+                         "(%s) Failed to demosaic Bayer image with NPP (status %d, sync: %s); "
+                         "skipping NITROS publication.",
+                         stream.name.c_str(), static_cast<int>(npp_status),
+                         cudaGetErrorString(sync_err));
+            cudaFree(p_gpu_rgb);
+            return;
+        }
+    }
+    else  // is_rgb8: no demosaicing needed, copy the host buffer straight onto the device
+    {
+        cuda_err = cudaMemcpy(p_gpu_rgb, p_img_msg->data.data(), RGB_SIZE, cudaMemcpyHostToDevice);
+        if (cuda_err != cudaSuccess)
+        {
+            RCLCPP_ERROR(logger_, "(%s) Failed to copy image to device for NITROS image: %s.",
+                         stream.name.c_str(), cudaGetErrorString(cuda_err));
+            cudaFree(p_gpu_rgb);
+            return;
+        }
+    }
+
+    //--- build the NITROS image wrapping the device buffer and publish it
+    nvidia::isaac_ros::nitros::NitrosImage nitros_image =
+      nvidia::isaac_ros::nitros::NitrosImageBuilder()
+        .WithHeader(p_img_msg->header)
+        .WithEncoding(sensor_msgs::image_encodings::RGB8)
+        .WithDimensions(height, width)
+        .WithGpuData(p_gpu_rgb)
+        .Build();
+
+    stream.p_nitros_pub->publish(nitros_image);
+}
+#endif
 
 //==================================================================================================
 void CameraDriver::printCameraConfiguration() const
