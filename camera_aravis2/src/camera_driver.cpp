@@ -2025,7 +2025,8 @@ cudaError_t buildNppStreamContext(NppStreamContext& ctx)
     if ((err = cudaDeviceGetAttribute(&ctx.nMultiProcessorCount,
                                       cudaDevAttrMultiProcessorCount, dev)) != cudaSuccess ||
         (err = cudaDeviceGetAttribute(&ctx.nMaxThreadsPerMultiProcessor,
-                                      cudaDevAttrMaxThreadsPerMultiProcessor, dev)) != cudaSuccess ||
+                                      cudaDevAttrMaxThreadsPerMultiProcessor, dev))
+            != cudaSuccess ||
         (err = cudaDeviceGetAttribute(&ctx.nMaxThreadsPerBlock,
                                       cudaDevAttrMaxThreadsPerBlock, dev)) != cudaSuccess ||
         (err = cudaDeviceGetAttribute(&shared_mem_per_block,
@@ -2118,7 +2119,8 @@ void CameraDriver::publishNitrosImage(Stream& stream,
         if (cuda_err != cudaSuccess)
         {
             RCLCPP_ERROR(logger_,
-                         "(%s) Failed to build NPP stream context: %s; skipping NITROS publication.",
+                         "(%s) Failed to build NPP stream context: %s; "
+                         "skipping NITROS publication.",
                          stream.name.c_str(), cudaGetErrorString(cuda_err));
             cudaFree(p_gpu_bayer);
             cudaFree(p_gpu_rgb);
