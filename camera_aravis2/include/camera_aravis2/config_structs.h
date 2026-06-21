@@ -209,6 +209,24 @@ struct AnalogControl
     std::vector<std::tuple<std::string, float, float, float>> balance_ratio;
 };
 
+/**
+ * @brief Struct representing a rectangular mask region for masking detections.
+ */
+struct MaskRegion
+{
+    /// X coordinate of top-left corner.
+    int x = 0;
+
+    /// Y coordinate of top-left corner.
+    int y = 0;
+
+    /// Width of mask region.
+    int width = 0;
+
+    /// Height of mask region.
+    int height = 0;
+};
+
 }  // namespace camera_aravis2
 
 #endif  // CAMERA_ARAVIS2__CONFIG_STRUCTS_H_
