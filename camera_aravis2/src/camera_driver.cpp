@@ -33,6 +33,10 @@
 #include <rcl_interfaces/msg/integer_range.hpp>
 #include <rclcpp/time.hpp>
 
+// Std
+#include <algorithm>
+#include <cstring>
+
 #ifdef WITH_NITROS
 #include <cuda_runtime.h>
 #include <nppi_color_conversion.h>
@@ -154,6 +158,16 @@ void CameraDriver::setupParameters()
     nitros_enable_desc.read_only = true;
     declare_parameter<bool>("nitros_enable", false, nitros_enable_desc);
 #endif
+
+    //--- masking parameters
+    auto mask_regions_desc = rcl_interfaces::msg::ParameterDescriptor{};
+    mask_regions_desc.description =
+      "List of rectangular mask regions for each stream. Format: stream_name:x,y,width,height;"
+      "stream_name:x,y,width,height;... "
+      "Example: 'stream0:0,800,1920,280;stream1:0,750,1920,330' "
+      "Regions are filled with black pixels to prevent detection in masked areas.";
+    mask_regions_desc.read_only = true;
+    declare_parameter<std::string>("mask_regions", "", mask_regions_desc);
 
     //--- register parameter change callback
     p_parameter_callback_handle_ = add_on_set_parameters_callback(
@@ -311,6 +325,10 @@ bool CameraDriver::setupCameraStreamStructs()
         RCLCPP_FATAL(logger_, "Something went wrong in the initialization of the camera streams.");
         return false;
     }
+
+    //--- set up masking regions
+    if (!setupMaskingRegions())
+        return false;
 
     return true;
 }
@@ -1856,6 +1874,9 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
             p_img_msg = p_cvt_img_msg;
         }
 
+        //--- apply image masks (blocks out regions before YOLO detection)
+        applyImageMasks(p_img_msg, stream);
+
         //--- fill camera_info message
         fillCameraInfoMsg(stream, p_img_msg);
 
@@ -1979,6 +2000,157 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
         stream.p_cam_info_msg->width  = p_img_msg->width;
         stream.p_cam_info_msg->height = p_img_msg->height;
     }
+}
+
+//==================================================================================================
+[[nodiscard]] bool CameraDriver::setupMaskingRegions()
+{
+    std::string mask_regions_str = get_parameter("mask_regions").as_string();
+    if (mask_regions_str.empty())
+        return true;
+
+    RCLCPP_INFO(logger_, "Setting up mask regions: %s", mask_regions_str.c_str());
+
+    //--- Parse mask regions string: "stream_name:x,y,width,height;stream_name:x,y,width,height;..."
+    size_t pos = 0;
+    while (pos < mask_regions_str.length())
+    {
+        size_t semicolon_pos = mask_regions_str.find(';', pos);
+        if (semicolon_pos == std::string::npos)
+            semicolon_pos = mask_regions_str.length();
+
+        std::string region_str = mask_regions_str.substr(pos, semicolon_pos - pos);
+        pos                     = semicolon_pos + 1;
+
+        if (region_str.empty())
+            continue;
+
+        //--- Parse "stream_name:x,y,width,height"
+        size_t colon_pos = region_str.find(':');
+        if (colon_pos == std::string::npos)
+        {
+            RCLCPP_WARN(logger_, "Invalid mask region format: %s (expected 'stream_name:x,y,width,height')",
+                        region_str.c_str());
+            continue;
+        }
+
+        std::string stream_name = region_str.substr(0, colon_pos);
+        std::string coords_str  = region_str.substr(colon_pos + 1);
+
+        //--- Parse coordinates "x,y,width,height"
+        int x, y, width, height;
+        int parsed = sscanf(coords_str.c_str(), "%d,%d,%d,%d", &x, &y, &width, &height);
+        if (parsed != 4)
+        {
+            RCLCPP_WARN(logger_, "Invalid mask coordinates format: %s (expected 'x,y,width,height')",
+                        coords_str.c_str());
+            continue;
+        }
+
+        //--- Find matching stream and add mask region
+        for (uint i = 0; i < streams_.size(); ++i)
+        {
+            if (streams_[i].name == stream_name)
+            {
+                MaskRegion mask;
+                mask.x      = x;
+                mask.y      = y;
+                mask.width  = width;
+                mask.height = height;
+                streams_[i].mask_regions.push_back(mask);
+                RCLCPP_INFO(logger_, "Added mask region to stream %i (%s): x=%d, y=%d, width=%d, height=%d",
+                            i, stream_name.c_str(), x, y, width, height);
+                break;
+            }
+        }
+    }
+
+    return true;
+}
+
+//==================================================================================================
+[[nodiscard]] bool CameraDriver::applyImageMasks(sensor_msgs::msg::Image::SharedPtr& p_img_msg,
+                                                  const Stream& stream) const
+{
+    //--- If no masks are defined, nothing to do
+    if (stream.mask_regions.empty())
+        return true;
+
+    //--- Only support RGB8, BGR8, Mono8, and basic pixel formats
+    const std::string& encoding = p_img_msg->encoding;
+    int channels                 = 0;
+
+    if (encoding == sensor_msgs::image_encodings::RGB8 ||
+        encoding == sensor_msgs::image_encodings::BGR8)
+    {
+        channels = 3;
+    }
+    else if (encoding == sensor_msgs::image_encodings::MONO8)
+    {
+        channels = 1;
+    }
+    else if (encoding == sensor_msgs::image_encodings::RGBA8 ||
+             encoding == sensor_msgs::image_encodings::BGRA8)
+    {
+        channels = 4;
+    }
+    else if (encoding == "RGB16" || encoding == "BGR16")
+    {
+        channels = 3;
+    }
+    else if (encoding == "Mono16")
+    {
+        channels = 1;
+    }
+    else
+    {
+        //--- Unsupported encoding for masking
+        RCLCPP_WARN_ONCE(logger_,
+                         "Masking is not supported for encoding '%s' in stream '%s'. "
+                         "Only RGB8, BGR8, Mono8, RGBA8, BGRA8, and 16-bit variants are supported.",
+                         encoding.c_str(), stream.name.c_str());
+        return false;
+    }
+
+    //--- Apply each mask region
+    uint8_t* data_ptr = p_img_msg->data.data();
+    uint32_t width    = p_img_msg->width;
+    uint32_t height   = p_img_msg->height;
+    uint32_t step     = p_img_msg->step;
+
+    for (const auto& mask : stream.mask_regions)
+    {
+        //--- Validate mask bounds
+        int x_start = std::max(0, mask.x);
+        int y_start = std::max(0, mask.y);
+        int x_end   = std::min(static_cast<int>(width), mask.x + mask.width);
+        int y_end   = std::min(static_cast<int>(height), mask.y + mask.height);
+
+        if (x_start >= x_end || y_start >= y_end)
+            continue;
+
+        //--- Fill mask region with black (0) pixels
+        if (encoding == "Mono16" || encoding == "RGB16" || encoding == "BGR16")
+        {
+            //--- 16-bit images: fill with 0x00 (2 bytes per channel)
+            for (int y = y_start; y < y_end; ++y)
+            {
+                uint8_t* row_ptr = data_ptr + y * step + x_start * channels * 2;
+                memset(row_ptr, 0, (x_end - x_start) * channels * 2);
+            }
+        }
+        else
+        {
+            //--- 8-bit images: fill with 0x00 (1 byte per channel)
+            for (int y = y_start; y < y_end; ++y)
+            {
+                uint8_t* row_ptr = data_ptr + y * step + x_start * channels;
+                memset(row_ptr, 0, (x_end - x_start) * channels);
+            }
+        }
+    }
+
+    return true;
 }
 
 #ifdef WITH_NITROS
