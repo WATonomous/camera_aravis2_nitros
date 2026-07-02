@@ -62,6 +62,8 @@ You can also mask multiple regions on the same stream:
 mask_regions: "stream0:0,0,1920,100;stream0:0,1180,1920,100"
 ```
 
+
+# AI generated, wouldn't trust this since I haven't tested these scripts
 ## Usage Examples
 
 ### ROS 2 Launch File
