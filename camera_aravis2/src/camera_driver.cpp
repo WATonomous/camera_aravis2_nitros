@@ -2094,11 +2094,12 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
     {
         channels = 4;
     }
-    else if (encoding == "RGB16" || encoding == "BGR16")
+    else if (encoding == sensor_msgs::image_encodings::RGB16 ||
+             encoding == sensor_msgs::image_encodings::BGR16)
     {
         channels = 3;
     }
-    else if (encoding == "Mono16")
+    else if (encoding == sensor_msgs::image_encodings::MONO16)
     {
         channels = 1;
     }
