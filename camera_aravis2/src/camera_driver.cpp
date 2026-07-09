@@ -2130,9 +2130,9 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
         if (x_start >= x_end || y_start >= y_end)
             continue;
 
-        //--- Fill mask region with black (0) pixels
-        if (encoding == "Mono16" || encoding == "RGB16" || encoding == "BGR16")
-        {
+        if (encoding == sensor_msgs::image_encodings::MONO16 ||
+            encoding == sensor_msgs::image_encodings::RGB16 ||
+            encoding == sensor_msgs::image_encodings::BGR16)
             //--- 16-bit images: fill with 0x00 (2 bytes per channel)
             for (int y = y_start; y < y_end; ++y)
             {
