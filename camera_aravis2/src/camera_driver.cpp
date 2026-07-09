@@ -2048,6 +2048,7 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
         }
 
         //--- Find matching stream and add mask region
+        bool stream_found = false;
         for (uint i = 0; i < streams_.size(); ++i)
         {
             if (streams_[i].name == stream_name)
@@ -2060,9 +2061,14 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
                 streams_[i].mask_regions.push_back(mask);
                 RCLCPP_INFO(logger_, "Added mask region to stream %i (%s): x=%d, y=%d, width=%d, height=%d",
                             i, stream_name.c_str(), x, y, width, height);
+                stream_found = true;
                 break;
             }
         }
+
+        if (!stream_found)
+            RCLCPP_WARN(logger_, "Mask region specifies unknown stream '%s'; skipping region '%s'.",
+                        stream_name.c_str(), region_str.c_str());
     }
 
     return true;
