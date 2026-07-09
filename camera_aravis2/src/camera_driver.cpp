@@ -2039,10 +2039,17 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
 
         //--- Parse coordinates "x,y,width,height"
         int x, y, width, height;
-        int parsed = sscanf(coords_str.c_str(), "%d,%d,%d,%d", &x, &y, &width, &height);
+        const int parsed = sscanf(coords_str.c_str(), "%d,%d,%d,%d", &x, &y, &width, &height);
         if (parsed != 4)
         {
             RCLCPP_WARN(logger_, "Invalid mask coordinates format: %s (expected 'x,y,width,height')",
+                        coords_str.c_str());
+            continue;
+        }
+
+        if (width <= 0 || height <= 0)
+        {
+            RCLCPP_WARN(logger_, "Invalid mask region dimensions (width/height must be > 0): %s",
                         coords_str.c_str());
             continue;
         }
