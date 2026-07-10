@@ -2005,7 +2005,12 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
 //==================================================================================================
 [[nodiscard]] bool CameraDriver::setupMaskingRegions()
 {
-    std::string mask_regions_str = get_parameter("mask_regions").as_string();
+    // TODO(debug): mask_regions from the YAML parameter is not taking effect, so it is
+    // hardcoded here for testing/debugging. This runs the full parse + match + apply path
+    // with a known value, isolating whether the issue is YAML/parameter loading vs. the
+    // masking logic. Revert to reading the parameter once the config path is fixed.
+    std::string mask_regions_str = "stream0:0,760,1280,264";
+    // std::string mask_regions_str = get_parameter("mask_regions").as_string();
     if (mask_regions_str.empty())
         return true;
 
@@ -2098,8 +2103,14 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
     {
         channels = 3;
     }
-    else if (encoding == sensor_msgs::image_encodings::MONO8)
+    else if (encoding == sensor_msgs::image_encodings::MONO8 ||
+             encoding == sensor_msgs::image_encodings::BAYER_RGGB8 ||
+             encoding == sensor_msgs::image_encodings::BAYER_BGGR8 ||
+             encoding == sensor_msgs::image_encodings::BAYER_GBRG8 ||
+             encoding == sensor_msgs::image_encodings::BAYER_GRBG8)
     {
+        //--- Mono and Bayer mosaics are 1 byte per pixel. Zeroing the mosaic bytes yields a black
+        //--- region after the (GPU) debayer, since all-zero CFA samples debayer to black.
         channels = 1;
     }
     else if (encoding == sensor_msgs::image_encodings::RGBA8 ||
@@ -2112,8 +2123,13 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
     {
         channels = 3;
     }
-    else if (encoding == sensor_msgs::image_encodings::MONO16)
+    else if (encoding == sensor_msgs::image_encodings::MONO16 ||
+             encoding == sensor_msgs::image_encodings::BAYER_RGGB16 ||
+             encoding == sensor_msgs::image_encodings::BAYER_BGGR16 ||
+             encoding == sensor_msgs::image_encodings::BAYER_GBRG16 ||
+             encoding == sensor_msgs::image_encodings::BAYER_GRBG16)
     {
+        //--- Mono and Bayer mosaics at 16-bit are 2 bytes per pixel, 1 channel.
         channels = 1;
     }
     else
@@ -2121,7 +2137,8 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
         //--- Unsupported encoding for masking
         RCLCPP_WARN_ONCE(logger_,
                          "Masking is not supported for encoding '%s' in stream '%s'. "
-                         "Only RGB8, BGR8, Mono8, RGBA8, BGRA8, and 16-bit variants are supported.",
+                         "Only RGB8, BGR8, Mono8, RGBA8, BGRA8, Bayer, and 16-bit variants are "
+                         "supported.",
                          encoding.c_str(), stream.name.c_str());
         return false;
     }
@@ -2145,7 +2162,11 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
 
         if (encoding == sensor_msgs::image_encodings::MONO16 ||
             encoding == sensor_msgs::image_encodings::RGB16 ||
-            encoding == sensor_msgs::image_encodings::BGR16)
+            encoding == sensor_msgs::image_encodings::BGR16 ||
+            encoding == sensor_msgs::image_encodings::BAYER_RGGB16 ||
+            encoding == sensor_msgs::image_encodings::BAYER_BGGR16 ||
+            encoding == sensor_msgs::image_encodings::BAYER_GBRG16 ||
+            encoding == sensor_msgs::image_encodings::BAYER_GRBG16)
         {
             //--- 16-bit images: fill with 0x00 (2 bytes per channel)
             for (int y = y_start; y < y_end; ++y)
