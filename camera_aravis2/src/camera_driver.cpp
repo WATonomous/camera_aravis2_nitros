@@ -2009,8 +2009,8 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
     // hardcoded here for testing/debugging. This runs the full parse + match + apply path
     // with a known value, isolating whether the issue is YAML/parameter loading vs. the
     // masking logic. Revert to reading the parameter once the config path is fixed.
-    std::string mask_regions_str = "stream0:0,760,1280,264";
-    // std::string mask_regions_str = get_parameter("mask_regions").as_string();
+    // std::string mask_regions_str = "stream0:0,760,1280,264";
+    std::string mask_regions_str = get_parameter("mask_regions").as_string();
     if (mask_regions_str.empty())
         return true;
 
