@@ -518,7 +518,7 @@ class CameraDriver : public CameraAravisNodeBase
      *
      * @param[in,out] p_img_msg Pointer to image message to apply masking to.
      * @param[in] stream Stream object containing mask regions.
-     * @return True if masking was applied. False if no masks or unsupported format.
+     * @return True if the function completed successfully (including when no masks are configured). False for unsupported image encodings.
      */
     [[nodiscard]] bool applyImageMasks(sensor_msgs::msg::Image::SharedPtr& p_img_msg,
                                        const Stream& stream) const;
