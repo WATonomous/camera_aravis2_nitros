@@ -63,7 +63,7 @@ mask_regions: "stream0:0,0,1920,100;stream0:0,1180,1920,100"
 ```
 
 
-# AI generated, wouldn't trust this since I haven't tested these scripts
+> Note: The following snippets are examples only; please validate them in your environment.
 ## Usage Examples
 
 ### ROS 2 Launch File
