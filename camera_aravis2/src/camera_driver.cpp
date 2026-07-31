@@ -28,14 +28,14 @@
 
 #include "camera_aravis2/camera_driver.h"
 
+// Std
+#include <algorithm>
+#include <cstring>
+
 // ROS
 #include <rcl_interfaces/msg/floating_point_range.hpp>
 #include <rcl_interfaces/msg/integer_range.hpp>
 #include <rclcpp/time.hpp>
-
-// Std
-#include <algorithm>
-#include <cstring>
 
 #ifdef WITH_NITROS
 #include <cuda_runtime.h>
@@ -2034,7 +2034,8 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
         size_t colon_pos = region_str.find(':');
         if (colon_pos == std::string::npos)
         {
-            RCLCPP_WARN(logger_, "Invalid mask region format: %s (expected 'stream_name:x,y,width,height')",
+            RCLCPP_WARN(logger_,
+                        "Invalid mask region format: %s (expected 'stream_name:x,y,width,height')",
                         region_str.c_str());
             continue;
         }
@@ -2047,7 +2048,8 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
         const int parsed = sscanf(coords_str.c_str(), "%d,%d,%d,%d", &x, &y, &width, &height);
         if (parsed != 4)
         {
-            RCLCPP_WARN(logger_, "Invalid mask coordinates format: %s (expected 'x,y,width,height')",
+            RCLCPP_WARN(logger_,
+                        "Invalid mask coordinates format: %s (expected 'x,y,width,height')",
                         coords_str.c_str());
             continue;
         }
@@ -2071,7 +2073,8 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
                 mask.width  = width;
                 mask.height = height;
                 streams_[i].mask_regions.push_back(mask);
-                RCLCPP_INFO(logger_, "Added mask region to stream %i (%s): x=%d, y=%d, width=%d, height=%d",
+                RCLCPP_INFO(logger_,
+                            "Added mask region to stream %i (%s): x=%d, y=%d, width=%d, height=%d",
                             i, stream_name.c_str(), x, y, width, height);
                 stream_found = true;
                 break;
