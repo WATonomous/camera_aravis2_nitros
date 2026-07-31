@@ -158,6 +158,9 @@ class CameraDriver : public CameraAravisNodeBase
         /// Concurrent queue holding the buffer data to be processed in a separate thread.
         ConcurrentQueue<std::pair<ArvBuffer*, sensor_msgs::msg::Image::SharedPtr>>
           buffer_queue;
+
+        /// List of rectangular mask regions to be applied to this stream.
+        std::vector<MaskRegion> mask_regions;
     };
 
     //--- METHOD DECLARATION ---//
@@ -502,6 +505,23 @@ class CameraDriver : public CameraAravisNodeBase
      */
     void fillCameraInfoMsg(CameraDriver::Stream& stream,
                            const sensor_msgs::msg::Image::SharedPtr& p_img_msg) const;
+
+    /**
+     * @brief Set up masking regions from launch parameters.
+     *
+     * @return True if successful. False, otherwise.
+     */
+    [[nodiscard]] bool setupMaskingRegions();
+
+    /**
+     * @brief Apply masking regions to the image by filling them with black pixels.
+     *
+     * @param[in,out] p_img_msg Pointer to image message to apply masking to.
+     * @param[in] stream Stream object containing mask regions.
+     * @return True if the function completed successfully (including when no masks are configured). False for unsupported image encodings.
+     */
+    [[nodiscard]] bool applyImageMasks(sensor_msgs::msg::Image::SharedPtr& p_img_msg,
+                                       const Stream& stream) const;
 
 #ifdef WITH_NITROS
     /**
