@@ -29,6 +29,7 @@
 #include "camera_aravis2/image_buffer_pool.h"
 
 // Std
+#include <algorithm>
 #include <functional>
 
 namespace camera_aravis2
@@ -38,10 +39,14 @@ namespace camera_aravis2
 ImageBufferPool::ImageBufferPool(const rclcpp::Logger& logger,
                                  ArvStream* stream,
                                  size_t payload_size_bytes,
-                                 size_t n_preallocated_buffers) :
+                                 size_t n_preallocated_buffers,
+                                 size_t n_max_buffers) :
   stream_(stream),
   payload_size_bytes_(payload_size_bytes),
   n_buffers_(0),
+  max_buffers_((n_max_buffers == 0)
+                 ? 0
+                 : std::max(n_max_buffers, n_preallocated_buffers)),
   self_(this, [](ImageBufferPool*) {}),
   logger_(logger)
 {
@@ -109,6 +114,25 @@ void ImageBufferPool::allocateBuffers(size_t n)
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    //--- clamp against the maximum pool size. Buffers are never released once allocated, so an
+    //--- unbounded pool turns a consumer that persistently lags the sensor into a leak of one
+    //--- payload per frame.
+    if (max_buffers_ != 0)
+    {
+        const size_t n_remaining = (n_buffers_ >= max_buffers_) ? 0 : max_buffers_ - n_buffers_;
+        n                        = std::min(n, n_remaining);
+
+        if (n == 0)
+        {
+            RCLCPP_WARN_ONCE(logger_,
+                             "Image buffer pool reached its maximum size of %zu buffers. The "
+                             "consumer is not keeping up with the sensor; frames will be dropped "
+                             "by the stream instead of growing the pool further.",
+                             max_buffers_);
+            return;
+        }
+    }
+
     if (ARV_IS_STREAM(stream_))
     {
         for (size_t i = 0; i < n; ++i)
@@ -125,7 +149,8 @@ void ImageBufferPool::allocateBuffers(size_t n)
             ++n_buffers_;
         }
         RCLCPP_INFO_STREAM(logger_,
-                           "Allocated " << n << " image buffers of size " << payload_size_bytes_);
+                           "Allocated " << n << " image buffers of size " << payload_size_bytes_
+                                        << " (pool size: " << n_buffers_ << ")");
     }
     else
     {

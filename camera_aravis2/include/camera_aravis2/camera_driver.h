@@ -63,6 +63,8 @@ extern "C"
 
 
 #ifdef WITH_NITROS
+#include <cuda_runtime.h>
+
 #include <isaac_ros_managed_nitros/managed_nitros_publisher.hpp>
 #include <isaac_ros_nitros_image_type/nitros_image.hpp>
 #include <isaac_ros_nitros_image_type/nitros_image_builder.hpp>
@@ -141,6 +143,26 @@ class CameraDriver : public CameraAravisNodeBase
         /// suppressed in that mode, but camera_info must still be emitted on the conventional
         /// topic so downstream Isaac ROS nodes (e.g. RectifyNode) can synchronize against it.
         rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr p_cam_info_pub;
+
+        /// Dedicated CUDA stream carrying the NITROS upload and debayer work of this stream.
+        ///
+        /// Created with cudaStreamNonBlocking so it does not implicitly synchronize with the
+        /// legacy default stream. Using the default stream here would serialize this camera
+        /// against every other CUDA tenant in the process (e.g. a TensorRT node composed into the
+        /// same container), stalling the buffer processing thread and starving the aravis input
+        /// queue.
+        cudaStream_t cuda_stream = nullptr;
+
+        /// Persistent device buffer holding the uploaded Bayer frame.
+        ///
+        /// Reused across frames because both cudaMalloc and cudaFree synchronize the entire
+        /// device, which would reintroduce the very cross-tenant stall cuda_stream avoids. Only
+        /// ever touched by this stream's buffer processing thread, and the debayer is awaited
+        /// before publishNitrosImage returns, so no additional guarding is needed.
+        void* p_gpu_bayer = nullptr;
+
+        /// Allocated size of p_gpu_bayer in bytes. Zero while unallocated.
+        size_t gpu_bayer_size = 0;
 #endif
 
         /// Unique pointer to camera info manager.
@@ -525,18 +547,39 @@ class CameraDriver : public CameraAravisNodeBase
 
 #ifdef WITH_NITROS
     /**
+     * @brief Create the dedicated non-blocking CUDA stream used by the NITROS publish path.
+     *
+     * @param[in,out] stream Stream object to create the CUDA stream for.
+     * @return True if successful. False otherwise.
+     */
+    [[nodiscard]] bool setUpNitrosCudaStream(CameraDriver::Stream& stream);
+
+    /**
+     * @brief Release the CUDA resources held by the NITROS publish path of the given stream.
+     *
+     * @note Must only be called once the stream's buffer processing thread has been joined.
+     *
+     * @param[in,out] stream Stream object to release the CUDA resources of.
+     */
+    void releaseNitrosCudaResources(CameraDriver::Stream& stream);
+
+    /**
      * @brief Publish an image as a GPU-resident NITROS image.
      *
-     * The host image is uploaded to the device via cudaMemcpy and wrapped into a NitrosImage using
-     * a managed NITROS image builder. Bayer input is demosaiced into RGB8 on the GPU with NVIDIA
-     * Performance Primitives (nppiCFAToRGB); already-RGB8 input is uploaded as-is. The builder
-     * takes ownership of the device allocation and releases it once the NitrosImage has been
-     * consumed downstream.
+     * The host image is uploaded to the device and wrapped into a NitrosImage using a managed
+     * NITROS image builder. Bayer input is demosaiced into RGB8 on the GPU with NVIDIA Performance
+     * Primitives (nppiCFAToRGB); already-RGB8 input is uploaded as-is. The builder takes ownership
+     * of the RGB8 device allocation and releases it once the NitrosImage has been consumed
+     * downstream.
+     *
+     * All device work is issued on the stream's own non-blocking CUDA stream and awaited with
+     * cudaStreamSynchronize, so an unrelated CUDA tenant in the same process cannot stall the
+     * caller (the stream's buffer processing thread).
      *
      * @note NITROS has no Bayer image type, so the published image is always RGB8. Only RGB8 and
      * 8-bit Bayer encodings are supported; any other encoding is skipped.
      *
-     * @param[in,out] stream Stream object which holds the NITROS publisher.
+     * @param[in,out] stream Stream object which holds the NITROS publisher and CUDA resources.
      * @param[in] p_img_msg Pointer to the (already converted) image message to publish.
      */
     void publishNitrosImage(CameraDriver::Stream& stream,
