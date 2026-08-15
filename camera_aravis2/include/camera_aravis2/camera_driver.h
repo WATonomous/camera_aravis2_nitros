@@ -33,6 +33,7 @@
 #include <yaml-cpp/yaml.h>
 
 // Std
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -180,6 +181,16 @@ class CameraDriver : public CameraAravisNodeBase
         /// Concurrent queue holding the buffer data to be processed in a separate thread.
         ConcurrentQueue<std::pair<ArvBuffer*, sensor_msgs::msg::Image::SharedPtr>>
           buffer_queue;
+
+        /// Name of the step buffer_processing_thread is currently executing, as a static string,
+        /// together with the steady-clock timestamp (in ns) at which that step was entered.
+        ///
+        /// Written only by the processing thread and read by handleNewBufferSignal, which uses it
+        /// to attribute a starved stream input queue to a concrete step. Without this, a processing
+        /// thread that blocks indefinitely is indistinguishable from one that merely lags: both
+        /// show up only as the buffer pool growing by one buffer per frame.
+        std::atomic<const char*> processing_step{"not started"};
+        std::atomic<int64_t> processing_step_since_ns{0};
 
         /// List of rectangular mask regions to be applied to this stream.
         std::vector<MaskRegion> mask_regions;
@@ -544,6 +555,24 @@ class CameraDriver : public CameraAravisNodeBase
      */
     [[nodiscard]] bool applyImageMasks(sensor_msgs::msg::Image::SharedPtr& p_img_msg,
                                        const Stream& stream) const;
+
+    /**
+     * @brief Record which step the given stream's buffer processing thread has just entered.
+     *
+     * @param[in,out] stream Stream object to record the step for.
+     * @param[in] step Static string naming the step. Must have static storage duration.
+     */
+    static void markProcessingStep(CameraDriver::Stream& stream, const char* step);
+
+    /**
+     * @brief Number of milliseconds the given stream's processing thread has been in its current
+     * step.
+     *
+     * @param[in] stream Stream object to query.
+     * @return Elapsed milliseconds, and the name of the step, as recorded by markProcessingStep.
+     */
+    static std::pair<const char*, int64_t> getProcessingStepAge(
+      const CameraDriver::Stream& stream);
 
 #ifdef WITH_NITROS
     /**

@@ -1850,6 +1850,30 @@ void CameraDriver::spawnCameraStreams()
 }
 
 //==================================================================================================
+void CameraDriver::markProcessingStep(Stream& stream, const char* step)
+{
+    stream.processing_step.store(step, std::memory_order_relaxed);
+    stream.processing_step_since_ns.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch())
+        .count(),
+      std::memory_order_relaxed);
+}
+
+//==================================================================================================
+std::pair<const char*, int64_t> CameraDriver::getProcessingStepAge(const Stream& stream)
+{
+    const char* step     = stream.processing_step.load(std::memory_order_relaxed);
+    const int64_t since  = stream.processing_step_since_ns.load(std::memory_order_relaxed);
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+
+    return {(step == nullptr) ? "unknown" : step,
+            (since == 0) ? 0 : (now_ns - since) / 1000000};
+}
+
+//==================================================================================================
 void CameraDriver::processStreamBuffer(const uint stream_id)
 {
     using namespace std::chrono_literals;
@@ -1862,8 +1886,10 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
     while (stream.is_buffer_processed)
     {
         //--- pop buffer pointer from queue, blocking if no item is available
+        markProcessingStep(stream, "waiting for frame");
         std::pair<ArvBuffer*, sensor_msgs::msg::Image::SharedPtr> buffer_img_pair;
         stream.buffer_queue.pop(buffer_img_pair);
+        markProcessingStep(stream, "image metadata");
 
         //--- take ownership of pointers
         ArvBuffer* p_arv_buffer                      = std::get<0>(buffer_img_pair);
@@ -1888,6 +1914,7 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         //--- convert to ros format
         if (stream.cvt_pixel_format)
         {
+            markProcessingStep(stream, "pixel format conversion");
             sensor_msgs::msg::Image::SharedPtr p_cvt_img_msg =
               stream.p_buffer_pool->getRecyclableImg();
             stream.cvt_pixel_format(p_img_msg, p_cvt_img_msg);
@@ -1895,9 +1922,11 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         }
 
         //--- apply image masks (blocks out regions before YOLO detection)
+        markProcessingStep(stream, "image masking");
         applyImageMasks(p_img_msg, stream);
 
         //--- fill camera_info message
+        markProcessingStep(stream, "camera_info assembly");
         fillCameraInfoMsg(stream, p_img_msg);
 
         //--- publish
@@ -1908,17 +1937,25 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
             //--- replaces it) and emit only camera_info on the conventional topic so downstream
             //--- Isaac ROS nodes can synchronize against it.
             if (stream.p_cam_info_pub)
+            {
+                markProcessingStep(stream, "camera_info publish");
                 stream.p_cam_info_pub->publish(*stream.p_cam_info_msg);
+            }
             publishNitrosImage(stream, p_img_msg);
         }
         else
 #endif
         {
+            markProcessingStep(stream, "image_raw publish");
             stream.camera_pub.publish(p_img_msg, stream.p_cam_info_msg);
         }
 
         //--- do post frame processing
+        markProcessingStep(stream, "post frame processing");
         postFrameProcessingCallback(stream_id);
+
+        //--- release the frame (returns the aravis buffer to the stream's input queue)
+        markProcessingStep(stream, "frame release");
     }
 
     RCLCPP_INFO(logger_, "Finished processing thread for stream %i (%s)", stream_id,
@@ -2364,6 +2401,7 @@ void CameraDriver::publishNitrosImage(Stream& stream,
     const size_t RGB_SIZE = static_cast<size_t>(width) * height * 3;
     void* p_gpu_rgb       = nullptr;
 
+    markProcessingStep(stream, "NITROS device allocation (cudaMalloc)");
     cudaError_t cuda_err = cudaMalloc(&p_gpu_rgb, RGB_SIZE);
     if (cuda_err != cudaSuccess)
     {
@@ -2403,6 +2441,7 @@ void CameraDriver::publishNitrosImage(Stream& stream,
             stream.gpu_bayer_size = BAYER_SIZE;
         }
 
+        markProcessingStep(stream, "NITROS Bayer upload");
         cuda_err = cudaMemcpyAsync(stream.p_gpu_bayer, p_img_msg->data.data(), BAYER_SIZE,
                                    cudaMemcpyHostToDevice, stream.cuda_stream);
         if (cuda_err != cudaSuccess)
@@ -2439,6 +2478,7 @@ void CameraDriver::publishNitrosImage(Stream& stream,
         //--- them to finish before the RGB buffer is published downstream (and before the Bayer
         //--- staging buffer is reused by the next frame). Synchronizing only this stream leaves
         //--- unrelated GPU work in the process untouched.
+        markProcessingStep(stream, "NITROS debayer sync (cudaStreamSynchronize)");
         const cudaError_t sync_err = cudaStreamSynchronize(stream.cuda_stream);
 
         if (npp_status != NPP_SUCCESS || sync_err != cudaSuccess)
@@ -2454,6 +2494,7 @@ void CameraDriver::publishNitrosImage(Stream& stream,
     }
     else  // is_rgb8: no demosaicing needed, copy the host buffer straight onto the device
     {
+        markProcessingStep(stream, "NITROS RGB8 upload");
         cuda_err = cudaMemcpyAsync(p_gpu_rgb, p_img_msg->data.data(), RGB_SIZE,
                                    cudaMemcpyHostToDevice, stream.cuda_stream);
         if (cuda_err == cudaSuccess)
@@ -2469,6 +2510,7 @@ void CameraDriver::publishNitrosImage(Stream& stream,
     }
 
     //--- build the NITROS image wrapping the device buffer and publish it
+    markProcessingStep(stream, "NITROS image build and publish");
     nvidia::isaac_ros::nitros::NitrosImage nitros_image =
       nvidia::isaac_ros::nitros::NitrosImageBuilder()
         .WithHeader(p_img_msg->header)
@@ -2791,7 +2833,19 @@ void CameraDriver::handleNewBufferSignal(ArvStream* p_stream, gpointer p_user_da
     gint n_available_buffers;
     arv_stream_get_n_buffers(p_stream, &n_available_buffers, NULL);
     if (n_available_buffers == 0)
+    {
+        //--- An empty input queue means the processing thread has not returned any of the buffers
+        //--- handed to it. Report which step it is sitting in: growing the pool only hides the
+        //--- cause, and a thread blocked forever looks exactly like one that merely lags.
+        const auto step_age = getProcessingStepAge(stream);
+        RCLCPP_WARN_THROTTLE(
+          p_ca_instance->logger_, *p_ca_instance->get_clock(), 2000,
+          "(%s) Stream input queue starved: no buffer has been returned by the processing thread, "
+          "which has been in step '%s' for %ld ms. Growing the buffer pool to compensate.",
+          stream.sensor.frame_id.c_str(), step_age.first, step_age.second);
+
         stream.p_buffer_pool->allocateBuffers(1);
+    }
 
     if (p_arv_buffer == nullptr)
         return;
