@@ -71,6 +71,12 @@ CameraDriver::CameraDriver(const std::string& name, const rclcpp::NodeOptions& o
 //==================================================================================================
 CameraDriver::~CameraDriver()
 {
+#ifdef WITH_NITROS
+    //--- Release the per-stream CUDA resources. Safe here: the derived destructor has already run
+    //--- and joined every buffer processing thread, so no frame is in flight.
+    for (auto& stream : streams_)
+        releaseNitrosCudaResources(stream);
+#endif
 }
 
 //==================================================================================================
@@ -315,6 +321,10 @@ bool CameraDriver::setupCameraStreamStructs()
               topic_name.substr(0, topic_name.rfind('/')) + "/camera_info";
             stream.p_cam_info_pub =
               this->create_publisher<sensor_msgs::msg::CameraInfo>(cam_info_topic, rclcpp::QoS(10));
+
+            //--- create the dedicated CUDA stream the per-frame NITROS path dispatches onto
+            if (!setUpNitrosCudaStream(stream))
+                return false;
         }
 #endif
     }
@@ -1735,10 +1745,20 @@ void CameraDriver::spawnCameraStreams()
                 const auto STREAM_PAYLOAD_SIZE = arv_camera_get_payload(p_camera_, err.ref());
                 CHECK_GERROR_MSG(err, logger_, "In getting payload size of stream.");
 
-                // TODO: launch parameter for number of preallocated buffers
+                // TODO: launch parameters for the number of preallocated and maximum buffers
+                const size_t N_PREALLOCATED_BUFFERS = 10;
+
+                //--- Upper bound on the pool size. handleNewBufferSignal grows the pool by one
+                //--- buffer whenever the stream's input queue has run dry, and the pool never
+                //--- shrinks, so an unbounded pool leaks one payload per frame for as long as the
+                //--- processing thread lags. The bound trades those frames for a fixed memory
+                //--- ceiling (here ~32 payloads per stream).
+                const size_t N_MAX_BUFFERS = 32;
+
                 stream.p_buffer_pool.reset(
                   new ImageBufferPool(logger_, stream.p_arv_stream,
-                                      static_cast<guint>(STREAM_PAYLOAD_SIZE), 10));
+                                      static_cast<guint>(STREAM_PAYLOAD_SIZE),
+                                      N_PREALLOCATED_BUFFERS, N_MAX_BUFFERS));
 
                 stream.is_buffer_processed = true;
                 stream.buffer_processing_thread =
@@ -1830,6 +1850,30 @@ void CameraDriver::spawnCameraStreams()
 }
 
 //==================================================================================================
+void CameraDriver::markProcessingStep(Stream& stream, const char* step)
+{
+    stream.processing_step.store(step, std::memory_order_relaxed);
+    stream.processing_step_since_ns.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch())
+        .count(),
+      std::memory_order_relaxed);
+}
+
+//==================================================================================================
+std::pair<const char*, int64_t> CameraDriver::getProcessingStepAge(const Stream& stream)
+{
+    const char* step     = stream.processing_step.load(std::memory_order_relaxed);
+    const int64_t since  = stream.processing_step_since_ns.load(std::memory_order_relaxed);
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+
+    return {(step == nullptr) ? "unknown" : step,
+            (since == 0) ? 0 : (now_ns - since) / 1000000};
+}
+
+//==================================================================================================
 void CameraDriver::processStreamBuffer(const uint stream_id)
 {
     using namespace std::chrono_literals;
@@ -1842,8 +1886,10 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
     while (stream.is_buffer_processed)
     {
         //--- pop buffer pointer from queue, blocking if no item is available
+        markProcessingStep(stream, "waiting for frame");
         std::pair<ArvBuffer*, sensor_msgs::msg::Image::SharedPtr> buffer_img_pair;
         stream.buffer_queue.pop(buffer_img_pair);
+        markProcessingStep(stream, "image metadata");
 
         //--- take ownership of pointers
         ArvBuffer* p_arv_buffer                      = std::get<0>(buffer_img_pair);
@@ -1868,6 +1914,7 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         //--- convert to ros format
         if (stream.cvt_pixel_format)
         {
+            markProcessingStep(stream, "pixel format conversion");
             sensor_msgs::msg::Image::SharedPtr p_cvt_img_msg =
               stream.p_buffer_pool->getRecyclableImg();
             stream.cvt_pixel_format(p_img_msg, p_cvt_img_msg);
@@ -1875,9 +1922,11 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         }
 
         //--- apply image masks (blocks out regions before YOLO detection)
+        markProcessingStep(stream, "image masking");
         applyImageMasks(p_img_msg, stream);
 
         //--- fill camera_info message
+        markProcessingStep(stream, "camera_info assembly");
         fillCameraInfoMsg(stream, p_img_msg);
 
         //--- publish
@@ -1888,17 +1937,25 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
             //--- replaces it) and emit only camera_info on the conventional topic so downstream
             //--- Isaac ROS nodes can synchronize against it.
             if (stream.p_cam_info_pub)
+            {
+                markProcessingStep(stream, "camera_info publish");
                 stream.p_cam_info_pub->publish(*stream.p_cam_info_msg);
+            }
             publishNitrosImage(stream, p_img_msg);
         }
         else
 #endif
         {
+            markProcessingStep(stream, "image_raw publish");
             stream.camera_pub.publish(p_img_msg, stream.p_cam_info_msg);
         }
 
         //--- do post frame processing
+        markProcessingStep(stream, "post frame processing");
         postFrameProcessingCallback(stream_id);
+
+        //--- release the frame (returns the aravis buffer to the stream's input queue)
+        markProcessingStep(stream, "frame release");
     }
 
     RCLCPP_INFO(logger_, "Finished processing thread for stream %i (%s)", stream_id,
@@ -2222,10 +2279,17 @@ bool mapRosBayerToNppGrid(const std::string& encoding, NppiBayerGridPosition& gr
 }
 
 
-cudaError_t buildNppStreamContext(NppStreamContext& ctx)
+/**
+ * @brief Fill an NPP stream context that dispatches onto @p cuda_stream.
+ *
+ * @note Never pass the legacy default stream (0) here: NPP work issued on it implicitly
+ * synchronizes with every other blocking stream in the process, which serializes the camera
+ * pipeline against unrelated CUDA tenants.
+ */
+cudaError_t buildNppStreamContext(NppStreamContext& ctx, cudaStream_t cuda_stream)
 {
     ctx         = NppStreamContext{};
-    ctx.hStream = 0;  // NPP default stream
+    ctx.hStream = cuda_stream;
 
     cudaError_t err = cudaGetDevice(&ctx.nCudaDeviceId);
     if (err != cudaSuccess)
@@ -2256,6 +2320,49 @@ cudaError_t buildNppStreamContext(NppStreamContext& ctx)
 }  // namespace
 
 //==================================================================================================
+[[nodiscard]] bool CameraDriver::setUpNitrosCudaStream(Stream& stream)
+{
+    if (stream.cuda_stream)
+        return true;
+
+    //--- cudaStreamNonBlocking is essential, not an optimization: a stream created without it
+    //--- implicitly synchronizes with the legacy default stream, and thus transitively with any
+    //--- other blocking stream in the process. That would make each frame wait on unrelated GPU
+    //--- work (e.g. TensorRT inference in a node composed into the same container), stall this
+    //--- stream's buffer processing thread, and starve the aravis input queue - which the buffer
+    //--- pool then papers over by allocating an additional buffer for every single frame.
+    const cudaError_t cuda_err =
+      cudaStreamCreateWithFlags(&stream.cuda_stream, cudaStreamNonBlocking);
+    if (cuda_err != cudaSuccess)
+    {
+        RCLCPP_FATAL(logger_, "(%s) Failed to create CUDA stream for NITROS publication: %s.",
+                     stream.name.c_str(), cudaGetErrorString(cuda_err));
+        stream.cuda_stream = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+//==================================================================================================
+void CameraDriver::releaseNitrosCudaResources(Stream& stream)
+{
+    if (stream.cuda_stream)
+    {
+        cudaStreamSynchronize(stream.cuda_stream);
+        cudaStreamDestroy(stream.cuda_stream);
+        stream.cuda_stream = nullptr;
+    }
+
+    if (stream.p_gpu_bayer)
+    {
+        cudaFree(stream.p_gpu_bayer);
+        stream.p_gpu_bayer = nullptr;
+    }
+    stream.gpu_bayer_size = 0;
+}
+
+//==================================================================================================
 void CameraDriver::publishNitrosImage(Stream& stream,
                                       const sensor_msgs::msg::Image::SharedPtr& p_img_msg) const
 {
@@ -2280,11 +2387,21 @@ void CameraDriver::publishNitrosImage(Stream& stream,
         return;
     }
 
+    if (!stream.cuda_stream)
+    {
+        RCLCPP_ERROR_ONCE(logger_,
+                          "(%s) No CUDA stream available for NITROS publication.",
+                          stream.name.c_str());
+        return;
+    }
+
     //--- the device buffer handed to NITROS always holds packed RGB8. The NitrosImageBuilder takes
-    //--- ownership of it and releases it (cudaFree) once the NitrosImage is consumed downstream.
+    //--- ownership of it and releases it (cudaFree) once the NitrosImage is consumed downstream, so
+    //--- this one allocation cannot be hoisted out of the per-frame path.
     const size_t RGB_SIZE = static_cast<size_t>(width) * height * 3;
     void* p_gpu_rgb       = nullptr;
 
+    markProcessingStep(stream, "NITROS device allocation (cudaMalloc)");
     cudaError_t cuda_err = cudaMalloc(&p_gpu_rgb, RGB_SIZE);
     if (cuda_err != cudaSuccess)
     {
@@ -2298,25 +2415,39 @@ void CameraDriver::publishNitrosImage(Stream& stream,
     {
         //--- upload the raw Bayer frame and demosaic it into the RGB8 device buffer with NPP
         const size_t BAYER_SIZE = static_cast<size_t>(p_img_msg->step) * height;
-        void* p_gpu_bayer       = nullptr;
 
-        cuda_err = cudaMalloc(&p_gpu_bayer, BAYER_SIZE);
-        if (cuda_err != cudaSuccess)
+        //--- (re)allocate the persistent Bayer staging buffer only when its size does not fit. In
+        //--- steady state this branch is not taken, keeping the per-frame path free of the
+        //--- device-wide synchronization that cudaMalloc/cudaFree impose.
+        if (stream.gpu_bayer_size < BAYER_SIZE)
         {
-            RCLCPP_ERROR(logger_,
-                         "(%s) Failed to allocate %zu B of device memory for Bayer input: %s.",
-                         stream.name.c_str(), BAYER_SIZE, cudaGetErrorString(cuda_err));
-            cudaFree(p_gpu_rgb);
-            return;
+            if (stream.p_gpu_bayer)
+            {
+                cudaFree(stream.p_gpu_bayer);
+                stream.p_gpu_bayer    = nullptr;
+                stream.gpu_bayer_size = 0;
+            }
+
+            cuda_err = cudaMalloc(&stream.p_gpu_bayer, BAYER_SIZE);
+            if (cuda_err != cudaSuccess)
+            {
+                RCLCPP_ERROR(logger_,
+                             "(%s) Failed to allocate %zu B of device memory for Bayer input: %s.",
+                             stream.name.c_str(), BAYER_SIZE, cudaGetErrorString(cuda_err));
+                stream.p_gpu_bayer = nullptr;
+                cudaFree(p_gpu_rgb);
+                return;
+            }
+            stream.gpu_bayer_size = BAYER_SIZE;
         }
 
-        cuda_err = cudaMemcpy(p_gpu_bayer, p_img_msg->data.data(), BAYER_SIZE,
-                              cudaMemcpyHostToDevice);
+        markProcessingStep(stream, "NITROS Bayer upload");
+        cuda_err = cudaMemcpyAsync(stream.p_gpu_bayer, p_img_msg->data.data(), BAYER_SIZE,
+                                   cudaMemcpyHostToDevice, stream.cuda_stream);
         if (cuda_err != cudaSuccess)
         {
             RCLCPP_ERROR(logger_, "(%s) Failed to copy Bayer image to device for NITROS image: %s.",
                          stream.name.c_str(), cudaGetErrorString(cuda_err));
-            cudaFree(p_gpu_bayer);
             cudaFree(p_gpu_rgb);
             return;
         }
@@ -2326,28 +2457,29 @@ void CameraDriver::publishNitrosImage(Stream& stream,
 
 
         NppStreamContext npp_ctx;
-        cuda_err = buildNppStreamContext(npp_ctx);
+        cuda_err = buildNppStreamContext(npp_ctx, stream.cuda_stream);
         if (cuda_err != cudaSuccess)
         {
             RCLCPP_ERROR(logger_,
                          "(%s) Failed to build NPP stream context: %s; "
                          "skipping NITROS publication.",
                          stream.name.c_str(), cudaGetErrorString(cuda_err));
-            cudaFree(p_gpu_bayer);
             cudaFree(p_gpu_rgb);
             return;
         }
 
 
         const NppStatus npp_status = nppiCFAToRGB_8u_C1C3R_Ctx(
-          static_cast<const Npp8u*>(p_gpu_bayer), static_cast<int>(p_img_msg->step), src_size,
-          src_roi, static_cast<Npp8u*>(p_gpu_rgb), width * 3, bayer_grid, NPPI_INTER_UNDEFINED,
-          npp_ctx);
+          static_cast<const Npp8u*>(stream.p_gpu_bayer), static_cast<int>(p_img_msg->step),
+          src_size, src_roi, static_cast<Npp8u*>(p_gpu_rgb), width * 3, bayer_grid,
+          NPPI_INTER_UNDEFINED, npp_ctx);
 
-        //--- the debayer runs asynchronously on NPP's default stream; wait for it to finish (the
-        //--- Bayer input can be freed once it has) before the RGB buffer is published downstream.
-        const cudaError_t sync_err = cudaDeviceSynchronize();
-        cudaFree(p_gpu_bayer);
+        //--- the upload and debayer run asynchronously on this stream's own CUDA stream; wait for
+        //--- them to finish before the RGB buffer is published downstream (and before the Bayer
+        //--- staging buffer is reused by the next frame). Synchronizing only this stream leaves
+        //--- unrelated GPU work in the process untouched.
+        markProcessingStep(stream, "NITROS debayer sync (cudaStreamSynchronize)");
+        const cudaError_t sync_err = cudaStreamSynchronize(stream.cuda_stream);
 
         if (npp_status != NPP_SUCCESS || sync_err != cudaSuccess)
         {
@@ -2362,7 +2494,12 @@ void CameraDriver::publishNitrosImage(Stream& stream,
     }
     else  // is_rgb8: no demosaicing needed, copy the host buffer straight onto the device
     {
-        cuda_err = cudaMemcpy(p_gpu_rgb, p_img_msg->data.data(), RGB_SIZE, cudaMemcpyHostToDevice);
+        markProcessingStep(stream, "NITROS RGB8 upload");
+        cuda_err = cudaMemcpyAsync(p_gpu_rgb, p_img_msg->data.data(), RGB_SIZE,
+                                   cudaMemcpyHostToDevice, stream.cuda_stream);
+        if (cuda_err == cudaSuccess)
+            cuda_err = cudaStreamSynchronize(stream.cuda_stream);
+
         if (cuda_err != cudaSuccess)
         {
             RCLCPP_ERROR(logger_, "(%s) Failed to copy image to device for NITROS image: %s.",
@@ -2373,6 +2510,7 @@ void CameraDriver::publishNitrosImage(Stream& stream,
     }
 
     //--- build the NITROS image wrapping the device buffer and publish it
+    markProcessingStep(stream, "NITROS image build and publish");
     nvidia::isaac_ros::nitros::NitrosImage nitros_image =
       nvidia::isaac_ros::nitros::NitrosImageBuilder()
         .WithHeader(p_img_msg->header)
@@ -2695,7 +2833,19 @@ void CameraDriver::handleNewBufferSignal(ArvStream* p_stream, gpointer p_user_da
     gint n_available_buffers;
     arv_stream_get_n_buffers(p_stream, &n_available_buffers, NULL);
     if (n_available_buffers == 0)
+    {
+        //--- An empty input queue means the processing thread has not returned any of the buffers
+        //--- handed to it. Report which step it is sitting in: growing the pool only hides the
+        //--- cause, and a thread blocked forever looks exactly like one that merely lags.
+        const auto step_age = getProcessingStepAge(stream);
+        RCLCPP_WARN_THROTTLE(
+          p_ca_instance->logger_, *p_ca_instance->get_clock(), 2000,
+          "(%s) Stream input queue starved: no buffer has been returned by the processing thread, "
+          "which has been in step '%s' for %ld ms. Growing the buffer pool to compensate.",
+          stream.sensor.frame_id.c_str(), step_age.first, step_age.second);
+
         stream.p_buffer_pool->allocateBuffers(1);
+    }
 
     if (p_arv_buffer == nullptr)
         return;

@@ -61,8 +61,14 @@ class ImageBufferPool : public std::enable_shared_from_this<ImageBufferPool>
     // stream: weakly managed pointer to the stream. Used to register all allocated buffers
     // payload_size_bytes: size of a single buffer
     // n_preallocated_buffers: number of initially allocated and registered buffers
+    // n_max_buffers: upper bound on the number of buffers the pool may grow to. The pool never
+    //   releases a buffer once allocated, so without a bound a consumer that persistently lags
+    //   the sensor makes it grow by one buffer per frame indefinitely. Once the bound is reached,
+    //   frames are dropped by the stream (visible as underruns) instead of leaking memory.
+    //   Clamped to at least n_preallocated_buffers; 0 means unbounded.
     ImageBufferPool(const rclcpp::Logger& logger, ArvStream* stream,
-                    size_t payload_size_bytes, size_t n_preallocated_buffers = 2);
+                    size_t payload_size_bytes, size_t n_preallocated_buffers = 2,
+                    size_t n_max_buffers = 0);
     virtual ~ImageBufferPool();
 
     // Get an image whose lifespan is administrated by this pool (but not registered to the camera).
@@ -94,6 +100,9 @@ class ImageBufferPool : public std::enable_shared_from_this<ImageBufferPool>
 
     // Allocate new buffers which are wrapped by an image message and
     // push them to the internal aravis stream.
+    //
+    // Allocates fewer than n buffers, or none at all, if the pool's maximum size would be
+    // exceeded.
     void allocateBuffers(size_t n = 1);
 
   protected:
@@ -109,6 +118,7 @@ class ImageBufferPool : public std::enable_shared_from_this<ImageBufferPool>
     ArvStream* stream_         = NULL;
     size_t payload_size_bytes_ = 0;
     size_t n_buffers_          = 0;
+    size_t max_buffers_        = 0;
 
     std::map<const uint8_t*, sensor_msgs::msg::Image::SharedPtr> available_img_buffers_;
     std::map<sensor_msgs::msg::Image*, ArvBuffer*> used_buffers_;
