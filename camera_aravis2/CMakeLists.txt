@@ -106,6 +106,7 @@ add_library(${LIBRARY_NAME} SHARED
   src/camera_driver.cpp
   src/camera_xml_exporter.cpp
   src/conversion_utils.cpp
+  src/device_clock_mapper.cpp
   src/error.cpp
   src/image_buffer_pool.cpp
 )
@@ -177,6 +178,13 @@ if(BUILD_TESTING)
   ament_flake8()
   find_package(ament_cmake_lint_cmake REQUIRED)
   ament_lint_cmake()
+
+  # Unit tests (ROS-free, so they compile only the sources under test)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_device_clock_mapper
+    test/test_device_clock_mapper.cpp
+    src/device_clock_mapper.cpp
+  )
 endif()
 
 ament_package()

@@ -49,6 +49,12 @@ static const char* ARV_BUFFER_STATUS_FROM_INT[] =
    "ARV_BUFFER_STATUS_WRONG_PACKET_ID", "ARV_BUFFER_STATUS_SIZE_MISMATCH",
    "ARV_BUFFER_STATUS_FILLING", "ARV_BUFFER_STATUS_ABORTED"};
 
+/// Number of buckets the device clock offset window is split into.
+static constexpr int DEVICE_CLOCK_N_BUCKETS = 10;
+
+/// Period (ns) at which the device clock statistics of each stream are logged.
+static constexpr int64_t DEVICE_CLOCK_REPORT_PERIOD_NS = 5000000000;
+
 namespace camera_aravis2
 {
 
@@ -65,6 +71,8 @@ CameraDriver::CameraDriver(const std::string& name, const rclcpp::NodeOptions& o
   ,
   is_nitros_enable_(false)
 #endif
+  ,
+  is_device_clock_stamp_enable_(false)
 {
 }
 
@@ -175,6 +183,28 @@ void CameraDriver::setupParameters()
     mask_regions_desc.read_only = true;
     declare_parameter<std::string>("mask_regions", "", mask_regions_desc);
 
+    //--- device clock timestamping parameters
+    auto dev_clk_enable_desc = rcl_interfaces::msg::ParameterDescriptor{};
+    dev_clk_enable_desc.description =
+      "Stamp images with the camera's device timestamp mapped onto the host clock instead of the "
+      "host arrival time. Intended for cameras without PTP. If false, stamps are unchanged.";
+    dev_clk_enable_desc.read_only = true;
+    declare_parameter<bool>("device_clock_stamp_enable", false, dev_clk_enable_desc);
+
+    auto dev_clk_window_desc = rcl_interfaces::msg::ParameterDescriptor{};
+    dev_clk_window_desc.description =
+      "Length (s) of the sliding window over which the device-to-host clock offset is estimated. "
+      "Images are stamped with the arrival time during the first window after start-up.";
+    dev_clk_window_desc.read_only = true;
+    declare_parameter<double>("device_clock_window_s", 10.0, dev_clk_window_desc);
+
+    auto dev_clk_latency_desc = rcl_interfaces::msg::ParameterDescriptor{};
+    dev_clk_latency_desc.description =
+      "Constant minimum transfer latency (ms) subtracted from device clock stamps. "
+      "Keep at 0 until calibrated against a reference sensor.";
+    dev_clk_latency_desc.read_only = true;
+    declare_parameter<double>("device_clock_latency_ms", 0.0, dev_clk_latency_desc);
+
     //--- register parameter change callback
     p_parameter_callback_handle_ = add_on_set_parameters_callback(
       std::bind(&CameraDriver::handleDynamicParameterChange, this, std::placeholders::_1));
@@ -194,6 +224,21 @@ bool CameraDriver::setupCameraStreamStructs()
 #ifdef WITH_NITROS
     is_nitros_enable_ = get_parameter("nitros_enable").as_bool();
 #endif
+
+    is_device_clock_stamp_enable_ = get_parameter("device_clock_stamp_enable").as_bool();
+    double dev_clk_window_s       = get_parameter("device_clock_window_s").as_double();
+    const double DEV_CLK_LAT_MS   = get_parameter("device_clock_latency_ms").as_double();
+    if (dev_clk_window_s <= 0.0)
+    {
+        config_warn_msgs_.push_back("'device_clock_window_s' must be > 0. Using 10 s.");
+        dev_clk_window_s = 10.0;
+    }
+    if (is_device_clock_stamp_enable_)
+    {
+        RCLCPP_INFO(logger_, "Device clock stamping enabled (window %.1f s, latency %.2f ms). "
+                             "Using arrival time until the clock offset has converged.",
+                    dev_clk_window_s, DEV_CLK_LAT_MS);
+    }
 
     bool is_camera_info_url_param_empty = camera_info_urls.empty();
 
@@ -246,6 +291,10 @@ bool CameraDriver::setupCameraStreamStructs()
     for (uint i = 0; i < streams_.size(); ++i)
     {
         Stream& stream = streams_[i];
+
+        stream.clock_mapper.configure(static_cast<int64_t>(dev_clk_window_s * 1e9),
+                                      DEVICE_CLOCK_N_BUCKETS,
+                                      static_cast<int64_t>(DEV_CLK_LAT_MS * 1e6));
 
         //--- if no or insufficient stream names are specified, use ID as name
         stream.name            = (i < stream_names.size())
@@ -1909,7 +1958,7 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         }
 
         //--- set meta data of image message
-        fillImageMsgMetadata(p_img_msg, p_arv_buffer, stream.sensor, stream.image_roi);
+        fillImageMsgMetadata(p_img_msg, p_arv_buffer, stream);
 
         //--- convert to ros format
         if (stream.cvt_pixel_format)
@@ -1983,9 +2032,11 @@ bool CameraDriver::adjustImageRoi(ImageRoi& img_roi, ArvBuffer* p_buffer) const
 //==================================================================================================
 void CameraDriver::fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_img_msg,
                                         ArvBuffer* p_buffer,
-                                        const Sensor& sensor,
-                                        const ImageRoi& img_roi) const
+                                        Stream& stream)
 {
+    const Sensor& sensor    = stream.sensor;
+    const ImageRoi& img_roi = stream.image_roi;
+
     std::shared_ptr<GvTransportLayerControl> p_gv_tl_control =
       std::dynamic_pointer_cast<GvTransportLayerControl>(p_tl_control_);
 
@@ -2013,7 +2064,12 @@ void CameraDriver::fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_im
     }
 
     if (!isBufferTimestampSet)
-        p_img_msg->header.stamp = rclcpp::Time(arv_buffer_get_system_timestamp(p_buffer));
+    {
+        if (is_device_clock_stamp_enable_)
+            p_img_msg->header.stamp = rclcpp::Time(computeDeviceClockStamp(p_buffer, stream));
+        else
+            p_img_msg->header.stamp = rclcpp::Time(arv_buffer_get_system_timestamp(p_buffer));
+    }
     p_img_msg->header.frame_id = sensor.frame_id;
 
     //--- fill image meta data
@@ -2021,6 +2077,76 @@ void CameraDriver::fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_im
     p_img_msg->height   = img_roi.height;
     p_img_msg->encoding = sensor.pixel_format;
     p_img_msg->step     = (img_roi.width * sensor.n_bits_pixel) / 8;
+}
+
+//==================================================================================================
+int64_t CameraDriver::computeDeviceClockStamp(ArvBuffer* p_buffer, Stream& stream)
+{
+    const int64_t ARRIVAL_NS = static_cast<int64_t>(arv_buffer_get_system_timestamp(p_buffer));
+    const int64_t DEVICE_NS  = static_cast<int64_t>(arv_buffer_get_timestamp(p_buffer));
+    const char* NAME         = stream.sensor.frame_id.c_str();
+
+    RCLCPP_DEBUG(logger_, "(%s) device_ns=%ld arrival_ns=%ld", NAME, DEVICE_NS, ARRIVAL_NS);
+
+    //--- without a device timestamp there is nothing to map
+    if (DEVICE_NS <= 0)
+    {
+        RCLCPP_WARN_ONCE(logger_, "(%s) Frame carries no device timestamp. Using arrival time.",
+                         NAME);
+        return ARRIVAL_NS;
+    }
+
+    const DeviceClockMapper::Result RESULT = stream.clock_mapper.map(DEVICE_NS, ARRIVAL_NS);
+    stream.clock_stats.add(RESULT, ARRIVAL_NS);
+
+    if (RESULT.was_reset)
+    {
+        RCLCPP_WARN(logger_, "(%s) Device clock jumped against host clock (camera restart or host "
+                             "clock step). Re-estimating offset.",
+                    NAME);
+    }
+    if (RESULT.clamped)
+    {
+        RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 1000,
+                             "(%s) Device clock stamp was later than arrival time. Clamped.",
+                             NAME);
+    }
+    if (RESULT.converged != stream.is_clock_converged)
+    {
+        stream.is_clock_converged = RESULT.converged;
+        RCLCPP_INFO(logger_, "(%s) Device clock offset %s (offset %.6f s).", NAME,
+                    RESULT.converged ? "converged, stamping from device clock"
+                                     : "not converged, stamping with arrival time",
+                    static_cast<double>(RESULT.offset_ns) * 1e-9);
+    }
+
+    //--- periodic per-stream report (the first frame only starts the reporting period)
+    if (stream.clock_last_report_ns == 0)
+    {
+        stream.clock_last_report_ns        = ARRIVAL_NS;
+        stream.clock_last_report_offset_ns = RESULT.offset_ns;
+    }
+    if (ARRIVAL_NS - stream.clock_last_report_ns >= DEVICE_CLOCK_REPORT_PERIOD_NS)
+    {
+        const DeviceClockStats& STATS  = stream.clock_stats;
+        const int64_t OFFSET_CHANGE_NS = STATS.offset_ns - stream.clock_last_report_offset_ns;
+        RCLCPP_INFO(logger_,
+                    "(%s) device clock: converged=%d offset=%.6f s (change %+.3f ms) "
+                    "arrival-stamp min/mean/max=%.2f/%.2f/%.2f ms clamped=%ld resets=%ld "
+                    "frames=%ld",
+                    NAME, STATS.converged ? 1 : 0, static_cast<double>(STATS.offset_ns) * 1e-9,
+                    static_cast<double>(OFFSET_CHANGE_NS) * 1e-6,
+                    static_cast<double>(STATS.min_arrival_minus_stamp_ns) * 1e-6,
+                    static_cast<double>(STATS.sum_arrival_minus_stamp_ns) * 1e-6 /
+                      static_cast<double>(STATS.n_frames),
+                    static_cast<double>(STATS.max_arrival_minus_stamp_ns) * 1e-6,
+                    STATS.n_clamped, STATS.n_resets, STATS.n_frames);
+        stream.clock_last_report_offset_ns = STATS.offset_ns;
+        stream.clock_last_report_ns        = ARRIVAL_NS;
+        stream.clock_stats.clear();
+    }
+
+    return RESULT.stamp_ns;
 }
 
 //==================================================================================================
