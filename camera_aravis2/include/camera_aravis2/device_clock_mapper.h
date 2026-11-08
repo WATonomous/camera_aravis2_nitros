@@ -121,19 +121,19 @@ class DeviceClockMapper
  */
 struct DeviceClockStats
 {
-    int64_t n_frames               = 0;
-    int64_t n_clamped              = 0;
-    int64_t n_resets               = 0;
+    int64_t n_frames                   = 0;
+    int64_t n_clamped                  = 0;
+    int64_t n_resets                   = 0;
     int64_t sum_arrival_minus_stamp_ns = 0;
     int64_t min_arrival_minus_stamp_ns = 0;
     int64_t max_arrival_minus_stamp_ns = 0;
-    int64_t offset_ns              = 0;
-    bool converged                 = false;
+    int64_t offset_ns                  = 0;
+    bool converged                     = false;
 
     /// Add one frame's result.
     void add(const DeviceClockMapper::Result& result, int64_t arrival_ns);
 
-    /// Clear all counters (keeps nothing).
+    /// Clear all counters.
     void clear();
 };
 

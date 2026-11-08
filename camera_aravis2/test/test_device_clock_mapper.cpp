@@ -26,7 +26,6 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-
 #include <gtest/gtest.h>
 
 // Std
@@ -67,24 +66,31 @@ class CameraSim
 
     Frame next(int64_t extra_delay_ns = 0)
     {
-        Frame f;
-        f.capture_ns = capture_ns_;
         const double ELAPSED_NS = static_cast<double>(capture_ns_ - kHostStart);
         const int64_t JITTER_NS = static_cast<int64_t>(jitter_(rng_));
+
+        Frame f;
+        f.capture_ns = capture_ns_;
         f.device_ns  = device_base_ns_ + static_cast<int64_t>(ELAPSED_NS * (1.0 + drift_));
         f.arrival_ns = capture_ns_ + kMinDelay + JITTER_NS + extra_delay_ns;
         capture_ns_ += kFramePeriod;
         return f;
     }
 
-    void skipFrames(int n) { capture_ns_ += n * kFramePeriod; }
+    void skipFrames(int n)
+    {
+        capture_ns_ += n * kFramePeriod;
+    }
     /// Host clock jumps by step_ns; the device counter keeps running undisturbed.
     void stepHostClock(int64_t step_ns)
     {
         capture_ns_ += step_ns;
         device_base_ns_ -= step_ns;
     }
-    void rebootCamera() { device_base_ns_ = 5 * kMs - (capture_ns_ - kHostStart); }
+    void rebootCamera()
+    {
+        device_base_ns_ = 5 * kMs - (capture_ns_ - kHostStart);
+    }
 
     static constexpr int64_t kHostStart = 1760000000LL * kSec;  // ~2025 epoch in ns
 
@@ -302,8 +308,8 @@ TEST(DeviceClockMapper, StaleMinimaExpireAfterLongStall)
         Frame f = cam.next();
         m.map(f.device_ns, f.arrival_ns);
     }
-    cam.skipFrames(20 * 15);         // camera stalls for 15 s (longer than the window) ...
-    cam.stepHostClock(5 * kMs);      // ... while NTP nudges the host clock by 5 ms
+    cam.skipFrames(20 * 15);     // camera stalls for 15 s (longer than the window) ...
+    cam.stepHostClock(5 * kMs);  // ... while NTP nudges the host clock by 5 ms
     for (int i = 0; i < 20 * 5; ++i)
     {
         Frame f  = cam.next();
