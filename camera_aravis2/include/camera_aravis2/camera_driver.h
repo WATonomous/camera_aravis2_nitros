@@ -58,6 +58,7 @@ extern "C"
 #include "camera_aravis2/concurrent_queue.hpp"
 #include "camera_aravis2/config_structs.h"
 #include "camera_aravis2/conversion_utils.h"
+#include "camera_aravis2/device_clock_mapper.h"
 #include "camera_aravis2/image_buffer_pool.h"
 #include <camera_aravis2_msgs/msg/camera_diagnostics.hpp>
 #include <camera_aravis2_msgs/srv/calculate_white_balance.hpp>
@@ -194,6 +195,22 @@ class CameraDriver : public CameraAravisNodeBase
 
         /// List of rectangular mask regions to be applied to this stream.
         std::vector<MaskRegion> mask_regions;
+
+        /// Maps the device timestamp onto the host clock (only if device_clock_stamp_enable).
+        /// Only touched by buffer_processing_thread, so no additional guarding is needed.
+        DeviceClockMapper clock_mapper;
+
+        /// Device clock statistics accumulated since the last report.
+        DeviceClockStats clock_stats;
+
+        /// Host time (ns) of the last device clock report. Zero before the first report.
+        int64_t clock_last_report_ns = 0;
+
+        /// Offset (ns) printed in the last device clock report, to show its change.
+        int64_t clock_last_report_offset_ns = 0;
+
+        /// Whether the last mapped frame was stamped from the device clock.
+        bool is_clock_converged = false;
     };
 
     //--- METHOD DECLARATION ---//
@@ -522,13 +539,24 @@ class CameraDriver : public CameraAravisNodeBase
      *
      * @param[in,out] p_img_msg Pointer to image message.
      * @param[in] p_buffer Pointer to aravis buffer holding the pixel data.
-     * @param[in] sensor Sensor object corresponding to image. Used to set frame_id, image_encoding,
-     * and more.
-     * @param[in] img_roi Image ROI.
+     * @param[in,out] stream Stream the image belongs to. Provides the sensor (frame_id,
+     * image_encoding, ...), the image ROI, and the device clock mapper.
      */
     void fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_img_msg,
-                              ArvBuffer* p_buffer, const Sensor& sensor,
-                              const ImageRoi& img_roi) const;
+                              ArvBuffer* p_buffer, Stream& stream);
+
+    /**
+     * @brief Compute the stamp of a frame from its device timestamp mapped onto the host clock,
+     * and periodically log the device clock statistics of the stream.
+     *
+     * Falls back to the host arrival time while the offset estimate has not converged, or if the
+     * buffer carries no device timestamp.
+     *
+     * @param[in] p_buffer Pointer to aravis buffer of the frame.
+     * @param[in,out] stream Stream the frame belongs to.
+     * @return Stamp in ns on the host system clock.
+     */
+    int64_t computeDeviceClockStamp(ArvBuffer* p_buffer, Stream& stream);
 
     /**
      * @brief Fill camera_info message.
@@ -703,6 +731,9 @@ class CameraDriver : public CameraAravisNodeBase
     /// Flag indicating if images are additionally published as NITROS images.
     bool is_nitros_enable_;
 #endif
+
+    /// Flag indicating if images are stamped from the device clock instead of arrival time.
+    bool is_device_clock_stamp_enable_;
 
     /// YAML node holding diagnostic features
     YAML::Node diagnostic_features_;
